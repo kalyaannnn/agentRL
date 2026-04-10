@@ -77,5 +77,5 @@ def test_smoke_split_uses_easy_builtin_problems() -> None:
     prompt = env.reset()
     answer = int(env.state()["answer"])
 
-    assert "Problem:" in prompt
-    assert answer in {3, 5, 7, 8, 9}
+    assert "Reply with exactly one line and nothing else" in prompt
+    assert answer in {2, 3, 4, 5, 6}

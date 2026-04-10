@@ -43,6 +43,13 @@ class MathEnvironment(BaseEnvironment):
         """Return the next arithmetic prompt."""
 
         self._current_problem = self._rng.choice(self._problems)
+        if self.split == "smoke":
+            return (
+                "Solve the arithmetic problem.\n"
+                "Reply with exactly one line and nothing else:\n"
+                "Final answer: <integer>\n\n"
+                f"Problem: {self._current_problem.prompt}"
+            )
         return (
             "Solve the arithmetic problem and reply with exactly one line:\n"
             "Final answer: <integer>\n\n"
@@ -68,14 +75,14 @@ class MathEnvironment(BaseEnvironment):
 
     def _default_problems(self, split: str) -> list[MathProblem]:
         smoke = [
+            MathProblem("1 + 1", 2),
             MathProblem("2 + 1", 3),
+            MathProblem("2 + 2", 4),
+            MathProblem("3 + 1", 4),
             MathProblem("3 + 2", 5),
-            MathProblem("7 - 4", 3),
-            MathProblem("9 - 2", 7),
-            MathProblem("4 + 4", 8),
-            MathProblem("8 - 5", 3),
-            MathProblem("6 + 3", 9),
-            MathProblem("5 + 2", 7),
+            MathProblem("4 + 1", 5),
+            MathProblem("4 + 2", 6),
+            MathProblem("5 + 1", 6),
         ]
         train = [
             MathProblem("7 + 5", 12),
