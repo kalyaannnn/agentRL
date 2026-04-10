@@ -18,7 +18,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--group-size", type=int, default=4, help="Responses sampled per prompt.")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Maximum generated tokens per turn.")
     parser.add_argument("--output-dir", default="./checkpoints", help="Directory for metrics and replay files.")
-    parser.add_argument("--split", default="train", choices=["train", "eval"], help="Problem split to sample from.")
+    parser.add_argument(
+        "--split",
+        default="smoke",
+        choices=["smoke", "train", "eval"],
+        help="Problem split to sample from.",
+    )
     return parser
 
 

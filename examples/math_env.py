@@ -44,8 +44,8 @@ class MathEnvironment(BaseEnvironment):
 
         self._current_problem = self._rng.choice(self._problems)
         return (
-            "Solve the following problem. Show your reasoning briefly, then put the final line as "
-            "`Final answer: <integer>`.\n\n"
+            "Solve the arithmetic problem and reply with exactly one line:\n"
+            "Final answer: <integer>\n\n"
             f"Problem: {self._current_problem.prompt}"
         )
 
@@ -67,6 +67,16 @@ class MathEnvironment(BaseEnvironment):
         }
 
     def _default_problems(self, split: str) -> list[MathProblem]:
+        smoke = [
+            MathProblem("2 + 1", 3),
+            MathProblem("3 + 2", 5),
+            MathProblem("7 - 4", 3),
+            MathProblem("9 - 2", 7),
+            MathProblem("4 + 4", 8),
+            MathProblem("8 - 5", 3),
+            MathProblem("6 + 3", 9),
+            MathProblem("5 + 2", 7),
+        ]
         train = [
             MathProblem("7 + 5", 12),
             MathProblem("18 - 9", 9),
@@ -80,6 +90,8 @@ class MathEnvironment(BaseEnvironment):
             MathProblem("15 - 7", 8),
             MathProblem("5 * 5", 25),
         ]
+        if split == "smoke":
+            return smoke
         return train if split == "train" else eval_set
 
 

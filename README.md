@@ -24,7 +24,7 @@ config = GRPOConfig(
 
 trainer = GRPOTrainer(
     config=config,
-    environment=MathEnvironment(split="train"),
+    environment=MathEnvironment(split="smoke"),
     verifier=MathVerifier(),
 )
 
@@ -34,7 +34,7 @@ trainer.train()
 CLI example:
 
 ```bash
-python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5
+python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5 --split smoke
 ```
 
 ## Single-GPU Playbook

@@ -69,3 +69,13 @@ def test_train_math_uses_public_api_shape(monkeypatch) -> None:
     assert captured["environment"].split == "eval"
     assert captured["verifier"].__class__.__name__ == "MathVerifier"
     assert captured["trained"] is True
+
+
+def test_smoke_split_uses_easy_builtin_problems() -> None:
+    env = MathEnvironment(split="smoke", seed=0)
+
+    prompt = env.reset()
+    answer = int(env.state()["answer"])
+
+    assert "Problem:" in prompt
+    assert answer in {3, 5, 7, 8, 9}
