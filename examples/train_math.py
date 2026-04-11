@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split",
         default="smoke",
-        choices=["smoke", "train", "eval"],
+        choices=["smoke", "easy", "train", "eval"],
         help="Problem split to sample from.",
     )
     return parser

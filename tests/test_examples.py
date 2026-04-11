@@ -89,3 +89,15 @@ def test_smoke_verifier_requires_exact_one_line_format() -> None:
     assert verifier.verify("Final answer: 6", strict_state) == 1.0
     assert verifier.verify("6\nThe answer is 6.", strict_state) == 0.0
     assert verifier.verify("6Human: Solve the following equation", strict_state) == 0.0
+
+
+def test_easy_split_uses_harder_synthetic_problems_and_strict_format() -> None:
+    env = MathEnvironment(split="easy", seed=0)
+    verifier = MathVerifier()
+
+    prompt = env.reset()
+    strict_state = {"answer": 5, "split": "easy"}
+
+    assert "Reply with exactly one line and nothing else" in prompt
+    assert verifier.verify("Final answer: 5", strict_state) == 1.0
+    assert verifier.verify("5\nextra text", strict_state) == 0.0

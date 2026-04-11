@@ -44,7 +44,7 @@ class MathEnvironment(BaseEnvironment):
         """Return the next arithmetic prompt."""
 
         self._current_problem = self._rng.choice(self._problems)
-        if self.split == "smoke":
+        if self.split in {"smoke", "easy"}:
             return (
                 "Solve the arithmetic problem.\n"
                 "Reply with exactly one line and nothing else:\n"
@@ -85,6 +85,16 @@ class MathEnvironment(BaseEnvironment):
             MathProblem("4 + 2", 6),
             MathProblem("5 + 1", 6),
         ]
+        easy = [
+            MathProblem("7 - 4", 3),
+            MathProblem("8 - 3", 5),
+            MathProblem("6 + 5", 11),
+            MathProblem("9 + 4", 13),
+            MathProblem("3 + 4 - 2", 5),
+            MathProblem("5 + 6 - 3", 8),
+            MathProblem("10 - 2 + 1", 9),
+            MathProblem("2 + 7 + 3", 12),
+        ]
         train = [
             MathProblem("7 + 5", 12),
             MathProblem("18 - 9", 9),
@@ -100,6 +110,8 @@ class MathEnvironment(BaseEnvironment):
         ]
         if split == "smoke":
             return smoke
+        if split == "easy":
+            return easy
         return train if split == "train" else eval_set
 
 
@@ -111,7 +123,7 @@ class MathVerifier(BaseVerifier):
 
         answer = int(env_state["answer"])
         split = str(env_state.get("split", "train"))
-        extracted = self._extract_answer(response, strict=(split == "smoke"))
+        extracted = self._extract_answer(response, strict=(split in {"smoke", "easy"}))
         return 1.0 if extracted == answer else 0.0
 
     def _extract_answer(self, response: str, strict: bool = False) -> int | None:
