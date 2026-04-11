@@ -37,6 +37,32 @@ CLI example:
 python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5 --split smoke
 ```
 
+## Phase 2 Benchmark Harness
+
+The next validation phase uses a bundled filtered GSM8K-style subset: short
+single-step or near-single-step word problems with a strict exact-match
+verifier. This is still a lightweight built-in benchmark harness, not the full
+GSM8K dataset.
+
+Example:
+
+```bash
+python -m examples.benchmark_gsm8k_subset \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --steps 10 \
+  --batch-size 1 \
+  --group-size 4 \
+  --max-new-tokens 64 \
+  --split train \
+  --output-dir ./checkpoints_gsm8k_subset
+```
+
+Recommended progression:
+
+- use `smoke` to verify your runtime and reward pipeline
+- use `easy` and `train` to check that a small model gets non-degenerate rewards
+- use `examples.benchmark_gsm8k_subset` as the first realistic benchmark harness
+
 ## Canonical Smoke Config
 
 This is the validated first Colab smoke configuration for small models:
@@ -83,11 +109,45 @@ on the bundled `smoke` split. In a 3-step run with the config above:
 This is a smoke result, not a benchmark. The goal was to verify non-degenerate
 group rewards, replay artifacts, and real-model GRPO updates on a single GPU.
 
+## Validated Train-Split Run
+
+The same `Qwen/Qwen2.5-0.5B-Instruct` setup was also exercised on the bundled
+`train` split for 10 steps with:
+
+```python
+config = GRPOConfig(
+    model_name="Qwen/Qwen2.5-0.5B-Instruct",
+    steps=10,
+    batch_size=1,
+    group_size=4,
+    max_new_tokens=32,
+    output_dir="./checkpoints_train",
+    dtype="float16",
+    sdpa_backend="auto",
+    use_continuous_batching=False,
+    use_gradient_checkpointing=False,
+    do_sample=True,
+    temperature=0.8,
+)
+```
+
+Observed behavior from the Colab run:
+
+- non-degenerate rewards on most steps
+- `mean_reward` commonly between `0.5` and `0.75`
+- stable peak VRAM around `2.35 GB`
+- generation remained the dominant runtime cost
+- later steps reached all-correct groups (`mean_reward=1.0`, `reward_std=0.0`)
+
+This is still a prototype validation result, not a benchmark claim, but it
+shows that the harder synthetic `train` split is viable on a small model.
+
 ## Synthetic Ladder
 
 - `smoke`: ultra-easy addition-only problems for the first non-degenerate reward batch
 - `easy`: slightly harder synthetic arithmetic with small subtraction and 3-term expressions
 - `train` / `eval`: stricter general arithmetic splits that are harder for small models
+- `gsm8k_style_subset`: filtered word problems for the first benchmark-style run
 
 ## Single-GPU Playbook
 
