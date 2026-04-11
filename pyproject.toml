@@ -15,6 +15,9 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
+benchmark = [
+    "datasets>=2.19.0",
+]
 
 [build-system]
 requires = ["hatchling"]

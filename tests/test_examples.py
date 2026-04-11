@@ -5,7 +5,7 @@ import sys
 from examples.benchmark_gsm8k_subset import main as benchmark_gsm8k_main
 from examples import benchmark_gsm8k_subset, train_math
 from examples.gsm8k_subset import (
-    GSM8KStyleProblem,
+    GSM8KProblem,
     GSM8KSubsetEnvironment,
     GSM8KSubsetVerifier,
 )
@@ -113,9 +113,10 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
     env = GSM8KSubsetEnvironment(
         split="train",
         problems=[
-            GSM8KStyleProblem(
+            GSM8KProblem(
                 "A jar has 10 candies and 3 more are added. How many candies are in the jar?",
                 13,
+                "10 + 3 = 13\n#### 13",
             )
         ],
         seed=123,
@@ -126,7 +127,7 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
     _, done = env.step("Final answer: 13")
     reward = verifier.verify("Final answer: 13", env.state())
 
-    assert "grade-school math word problem" in prompt
+    assert "GSM8K math word problem" in prompt
     assert "Final answer: <integer>" in prompt
     assert done is True
     assert reward == 1.0
@@ -134,15 +135,53 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
 
 def test_gsm8k_subset_verifier_requires_exact_one_line_format() -> None:
     verifier = GSM8KSubsetVerifier()
-    state = {"answer": 18, "split": "train", "dataset": "gsm8k_style_subset"}
+    state = {"answer": 18, "split": "train", "dataset": "gsm8k"}
 
     assert verifier.verify("Final answer: 18", state) == 1.0
     assert verifier.verify("18", state) == 0.0
     assert verifier.verify("Final answer: 18\nextra", state) == 0.0
 
 
+def test_gsm8k_subset_extracts_answer_and_filters_examples(monkeypatch) -> None:
+    rows = [
+        {"question": "Short question one?", "answer": "work\n#### 7"},
+        {"question": "This question is intentionally much too long " * 20, "answer": "work\n#### 99"},
+        {"question": "Short question two?", "answer": "more work\n#### 11"},
+    ]
+
+    def fake_load_dataset_split(self):
+        assert self.dataset_name == "gsm8k"
+        assert self.dataset_config_name == "main"
+        assert self.split == "train"
+        return rows
+
+    monkeypatch.setattr(GSM8KSubsetEnvironment, "_load_dataset_split", fake_load_dataset_split)
+
+    env = GSM8KSubsetEnvironment(
+        split="train",
+        subset_size=2,
+        max_question_words=6,
+    )
+
+    prompt = env.reset()
+    state = env.state()
+
+    assert len(env._problems) == 2
+    assert "Problem:" in prompt
+    assert state["answer"] in {7, 11}
+
+
 def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     captured = {}
+
+    class StubEnvironment:
+        def __init__(self, split, subset_size, max_question_words):
+            self.split = split
+            self.subset_size = subset_size
+            self.max_question_words = max_question_words
+
+    class StubVerifier:
+        pass
 
     class StubTrainer:
         def __init__(self, config, environment, verifier):
@@ -154,6 +193,8 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
             captured["trained"] = True
 
     monkeypatch.setattr(benchmark_gsm8k_subset, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(benchmark_gsm8k_subset, "GSM8KSubsetEnvironment", StubEnvironment)
+    monkeypatch.setattr(benchmark_gsm8k_subset, "GSM8KSubsetVerifier", StubVerifier)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -172,7 +213,11 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
             "--output-dir",
             "./bench",
             "--split",
-            "eval",
+            "test",
+            "--subset-size",
+            "16",
+            "--max-question-words",
+            "50",
             "--replay-every",
             "1",
         ],
@@ -187,6 +232,8 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     assert captured["config"].max_new_tokens == 48
     assert captured["config"].output_dir == "./bench"
     assert captured["config"].replay_every == 1
-    assert captured["environment"].split == "eval"
-    assert captured["verifier"].__class__.__name__ == "GSM8KSubsetVerifier"
+    assert captured["environment"].split == "test"
+    assert captured["environment"].subset_size == 16
+    assert captured["environment"].max_question_words == 50
+    assert captured["verifier"].__class__.__name__ == "StubVerifier"
     assert captured["trained"] is True

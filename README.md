@@ -39,10 +39,10 @@ python -m examples.train_math --model Qwen/Qwen2.5-1.5B-Instruct --steps 5 --spl
 
 ## Phase 2 Benchmark Harness
 
-The next validation phase uses a bundled filtered GSM8K-style subset: short
-single-step or near-single-step word problems with a strict exact-match
-verifier. This is still a lightweight built-in benchmark harness, not the full
-GSM8K dataset.
+The next validation phase uses a real filtered GSM8K subset loaded through the
+HuggingFace `datasets` package. AgentRL keeps only shorter GSM8K questions with
+integer final answers so the first benchmark run stays manageable on a single
+GPU while using authentic dataset examples.
 
 Example:
 
@@ -53,6 +53,8 @@ python -m examples.benchmark_gsm8k_subset \
   --batch-size 1 \
   --group-size 4 \
   --max-new-tokens 64 \
+  --subset-size 128 \
+  --max-question-words 45 \
   --split train \
   --output-dir ./checkpoints_gsm8k_subset
 ```
@@ -62,6 +64,12 @@ Recommended progression:
 - use `smoke` to verify your runtime and reward pipeline
 - use `easy` and `train` to check that a small model gets non-degenerate rewards
 - use `examples.benchmark_gsm8k_subset` as the first realistic benchmark harness
+
+Install the extra dependency before running the GSM8K benchmark:
+
+```bash
+pip install datasets
+```
 
 ## Canonical Smoke Config
 
@@ -147,7 +155,7 @@ shows that the harder synthetic `train` split is viable on a small model.
 - `smoke`: ultra-easy addition-only problems for the first non-degenerate reward batch
 - `easy`: slightly harder synthetic arithmetic with small subtraction and 3-term expressions
 - `train` / `eval`: stricter general arithmetic splits that are harder for small models
-- `gsm8k_style_subset`: filtered word problems for the first benchmark-style run
+- `gsm8k_subset`: filtered real GSM8K examples for the first benchmark-style run
 
 ## Single-GPU Playbook
 

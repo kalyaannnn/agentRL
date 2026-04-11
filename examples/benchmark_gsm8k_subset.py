@@ -27,8 +27,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split",
         default="train",
-        choices=["train", "eval"],
+        choices=["train", "test"],
         help="Benchmark subset split to sample from.",
+    )
+    parser.add_argument(
+        "--subset-size",
+        type=int,
+        default=128,
+        help="Number of filtered GSM8K examples to retain in the benchmark subset.",
+    )
+    parser.add_argument(
+        "--max-question-words",
+        type=int,
+        default=45,
+        help="Keep only GSM8K questions up to this word count.",
     )
     parser.add_argument(
         "--replay-every",
@@ -54,7 +66,11 @@ def main() -> None:
     )
     trainer = GRPOTrainer(
         config=config,
-        environment=GSM8KSubsetEnvironment(split=args.split),
+        environment=GSM8KSubsetEnvironment(
+            split=args.split,
+            subset_size=args.subset_size,
+            max_question_words=args.max_question_words,
+        ),
         verifier=GSM8KSubsetVerifier(),
     )
     trainer.train()
