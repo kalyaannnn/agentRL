@@ -54,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Serialize trajectories every N steps for benchmark inspection.",
     )
+    parser.add_argument(
+        "--reward-mode",
+        default="shaped",
+        choices=["shaped", "strict"],
+        help="Training reward mode. Use 'strict' for exact-match evaluation runs.",
+    )
     return parser
 
 
@@ -78,7 +84,7 @@ def main() -> None:
             max_question_words=args.max_question_words,
             curriculum=args.curriculum,
         ),
-        verifier=GSM8KSubsetVerifier(),
+        verifier=GSM8KSubsetVerifier(reward_mode=args.reward_mode),
     )
     trainer.train()
 

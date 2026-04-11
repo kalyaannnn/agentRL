@@ -121,7 +121,7 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
         ],
         seed=123,
     )
-    verifier = GSM8KSubsetVerifier()
+    verifier = GSM8KSubsetVerifier(reward_mode="strict")
 
     prompt = env.reset()
     _, done = env.step("Final answer: 13")
@@ -135,12 +135,24 @@ def test_gsm8k_subset_environment_and_verifier_roundtrip() -> None:
 
 
 def test_gsm8k_subset_verifier_requires_exact_one_line_format() -> None:
-    verifier = GSM8KSubsetVerifier()
+    verifier = GSM8KSubsetVerifier(reward_mode="strict")
     state = {"answer": 18, "split": "train", "dataset": "gsm8k"}
 
     assert verifier.verify("Final answer: 18", state) == 1.0
     assert verifier.verify("18", state) == 0.0
     assert verifier.verify("Final answer: 18\nextra", state) == 0.0
+
+
+def test_gsm8k_subset_shaped_verifier_rewards_partial_progress() -> None:
+    verifier = GSM8KSubsetVerifier(reward_mode="shaped")
+    state = {"answer": 18, "split": "train", "dataset": "gsm8k"}
+
+    assert verifier.verify("Final answer: 18", state) == 1.0
+    assert verifier.verify("Final answer: 18\nextra", state) == 0.75
+    assert verifier.verify("The answer is 18.", state) == 0.5
+    assert verifier.verify("Final answer: 17", state) == 0.2
+    assert verifier.verify("The answer is 17.", state) == 0.2
+    assert verifier.verify("I have no idea.", state) == 0.0
 
 
 def test_gsm8k_subset_extracts_answer_and_filters_examples(monkeypatch) -> None:
@@ -220,7 +232,8 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
             self.curriculum = curriculum
 
     class StubVerifier:
-        pass
+        def __init__(self, reward_mode):
+            self.reward_mode = reward_mode
 
     class StubTrainer:
         def __init__(self, config, environment, verifier):
@@ -261,6 +274,8 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
             "standard",
             "--replay-every",
             "1",
+            "--reward-mode",
+            "strict",
         ],
     )
 
@@ -277,5 +292,5 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     assert captured["environment"].subset_size == 16
     assert captured["environment"].max_question_words == 50
     assert captured["environment"].curriculum == "standard"
-    assert captured["verifier"].__class__.__name__ == "StubVerifier"
+    assert captured["verifier"].reward_mode == "strict"
     assert captured["trained"] is True

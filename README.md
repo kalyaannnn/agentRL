@@ -43,7 +43,10 @@ The next validation phase uses a real filtered GSM8K subset loaded through the
 HuggingFace `datasets` package. AgentRL keeps only shorter GSM8K questions with
 integer final answers, and the default `easy` curriculum ranks examples toward
 the simplest real problems first so the first benchmark run stays manageable on
-a single GPU while still using authentic dataset examples.
+a single GPU while still using authentic dataset examples. For training, the
+default `shaped` reward mode gives partial credit for correct formatting or
+numerically close answers so the run does not start from all-zero batches. For
+exact-match evaluation, switch back to `--reward-mode strict`.
 
 Example:
 
@@ -57,6 +60,7 @@ python -m examples.benchmark_gsm8k_subset \
   --subset-size 128 \
   --max-question-words 45 \
   --curriculum easy \
+  --reward-mode shaped \
   --split train \
   --output-dir ./checkpoints_gsm8k_subset
 ```
@@ -73,10 +77,10 @@ Install the extra dependency before running the GSM8K benchmark:
 pip install datasets
 ```
 
-If the standard GSM8K slice collapses to all-zero rewards at initialization,
-start with `--curriculum easy` first. It still uses real GSM8K examples, but it
-prefers shorter and simpler questions before expanding to the broader filtered
-subset.
+If the strict GSM8K run collapses to all-zero rewards at initialization, start
+with `--curriculum easy --reward-mode shaped` first. It still uses real GSM8K
+examples, but it gives the model a gradient signal before you move back to
+`--reward-mode strict` for evaluation.
 
 ## Canonical Smoke Config
 

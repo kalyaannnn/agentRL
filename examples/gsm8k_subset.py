@@ -190,13 +190,51 @@ class GSM8KSubsetEnvironment(BaseEnvironment):
 
 
 class GSM8KSubsetVerifier(BaseVerifier):
-    """Strict exact-match verifier for GSM8K subset runs."""
+    """Verifier for GSM8K subset runs.
+
+    `strict` mirrors benchmark evaluation and only accepts an exact
+    `Final answer: <integer>` line.
+
+    `shaped` is intended for training from a cold start on real GSM8K. It keeps
+    the same target answer, but rewards progressively for partial progress so
+    the policy can escape all-zero batches.
+    """
+
+    def __init__(self, reward_mode: str = "shaped") -> None:
+        if reward_mode not in {"strict", "shaped"}:
+            raise ValueError("reward_mode must be either 'strict' or 'shaped'.")
+        self.reward_mode = reward_mode
 
     def verify(self, response: str, env_state: dict[str, int | str]) -> float:
-        """Return 1.0 for an exact `Final answer: <integer>` match."""
+        """Return a deterministic reward for the predicted final integer."""
 
         answer = int(env_state["answer"])
-        match = _STRICT_FINAL_ANSWER_RE.fullmatch(response)
-        if match is None:
+        strict_match = _STRICT_FINAL_ANSWER_RE.fullmatch(response)
+        if strict_match is not None:
+            predicted = int(strict_match.group(1))
+            if predicted == answer:
+                return 1.0
+            if self.reward_mode == "strict":
+                return 0.0
+            tolerance = max(1, abs(answer) // 10)
+            return 0.2 if abs(predicted - answer) <= tolerance else 0.15
+
+        if self.reward_mode == "strict":
             return 0.0
-        return 1.0 if int(match.group(1)) == answer else 0.0
+
+        formatted = re.search(r"Final answer:\s*(-?\d+)", response, re.IGNORECASE)
+        if formatted is not None:
+            return 0.75 if int(formatted.group(1)) == answer else 0.15
+
+        integers = _INTEGER_RE.findall(response)
+        if not integers:
+            return 0.0
+
+        candidate = int(integers[-1])
+        if candidate == answer:
+            return 0.5
+
+        tolerance = max(1, abs(answer) // 10)
+        if abs(candidate - answer) <= tolerance:
+            return 0.2
+        return 0.0
