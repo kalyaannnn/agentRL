@@ -96,6 +96,58 @@ class Layout:
         return torch.zeros((batch, seq, 256), dtype=torch.float32)
 
 
+class ChunkedStepModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(use_cache=False)
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+        self.prefill_calls: list[tuple[int, int | None]] = []
+        self.decode_calls: list[tuple[int, int | None, int]] = []
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        use_cache: bool = True,
+    ) -> SimpleNamespace:
+        del attention_mask, use_cache
+        past_length = None if past_key_values is None else int(past_key_values[0][0].shape[2])
+        if input_ids.shape[-1] > 1:
+            self.prefill_calls.append((input_ids.shape[-1], past_length))
+        else:
+            self.decode_calls.append((input_ids.shape[0], input_ids.shape[-1], past_length))
+        vocab = 256
+        logits = torch.full((input_ids.shape[0], input_ids.shape[1], vocab), -1e9, dtype=torch.float32)
+        if input_ids.shape[-1] > 1:
+            logits[:, -1, ord("a")] = 0.0
+        else:
+            next_tokens = torch.where(input_ids[:, -1] == ord("a"), ord("b"), 3)
+            logits[:, -1, :] = -1e9
+            logits[torch.arange(input_ids.shape[0]), -1, next_tokens] = 0.0
+
+        previous_length = 0 if past_length is None else past_length
+        new_length = previous_length + input_ids.shape[-1]
+        key = torch.zeros((input_ids.shape[0], 1, new_length, 1), dtype=torch.float32)
+        value = torch.zeros((input_ids.shape[0], 1, new_length, 1), dtype=torch.float32)
+        return SimpleNamespace(logits=logits, past_key_values=((key, value),))
+
+
+class ChunkedLayout:
+    def __init__(self) -> None:
+        self.model = ChunkedStepModel()
+
+    def policy_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+
 def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -117,3 +169,31 @@ def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     assert batch.rewards.tolist() == [[1.0, 1.0]]
     assert "padding_ratio" in batch.metadata
     assert 0.0 <= batch.metadata["padding_ratio"] <= 1.0
+
+
+def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+        prefill_chunk_size=4,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(label="x" * 12),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=ChunkedLayout(),
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.metadata["responses"] == [["ab", "ab"]]
+    assert orchestrator.layout.model.prefill_calls[:3] == [(4, None), (4, 4), (4, 8)]
+    first_decode, second_decode = orchestrator.layout.model.decode_calls[:2]
+    assert first_decode[:2] == (2, 1)
+    assert second_decode[:2] == (2, 1)
+    assert second_decode[2] == first_decode[2] + 1

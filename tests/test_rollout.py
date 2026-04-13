@@ -110,6 +110,52 @@ class FakeLayout:
         return logits
 
 
+class ChunkedPrefillModel(torch.nn.Module):
+    def __init__(self, output: str) -> None:
+        super().__init__()
+        self.output = [ord(character) for character in output]
+        self.config = SimpleNamespace(use_cache=False)
+        self.forward_calls: list[tuple[int, int | None]] = []
+        self.generate_called = False
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: int | None = None,
+        use_cache: bool = True,
+    ) -> SimpleNamespace:
+        del attention_mask, use_cache
+        marker = past_key_values
+        self.forward_calls.append((input_ids.shape[-1], marker))
+        vocab = 256
+        logits = torch.full((input_ids.shape[0], input_ids.shape[1], vocab), -1e9, dtype=torch.float32)
+        token = self.output[0] if input_ids.shape[-1] > 1 else self.output[1]
+        logits[:, -1, token] = 0.0
+        return SimpleNamespace(logits=logits, past_key_values=len(self.forward_calls))
+
+    def generate(self, **kwargs) -> torch.Tensor:
+        del kwargs
+        self.generate_called = True
+        raise AssertionError("generate() should not be used when chunked prefill is active.")
+
+
+class ChunkedPrefillLayout:
+    def __init__(self, output: str) -> None:
+        self.model = ChunkedPrefillModel(output)
+
+    def policy_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+
 def test_rollout_collects_multi_turn_grouped_batch() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -179,3 +225,40 @@ def test_rollout_warns_when_episode_hits_turn_cap(caplog: pytest.LogCaptureFixtu
 
     assert "max_episode_steps=1" in caplog.text
     assert batch.metadata["responses"] == [["x", "y"]]
+
+
+def test_rollout_uses_chunked_prefill_for_long_prompts() -> None:
+    class LongPromptEnvironment(BaseEnvironment):
+        def reset(self) -> str:
+            return "x" * 12
+
+        def step(self, action: str) -> tuple[str, bool]:
+            del action
+            return ("done", True)
+
+        def state(self) -> dict[str, str]:
+            return {"expected": "ok"}
+
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=2,
+        prefill_chunk_size=4,
+        do_sample=False,
+    )
+    layout = ChunkedPrefillLayout(output="ok")
+    orchestrator = RolloutOrchestrator(
+        config=config,
+        environment=LongPromptEnvironment(),
+        verifier=FinalAnswerVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=layout,
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.metadata["responses"] == [["ok", "ok"]]
+    assert layout.model.generate_called is False
+    assert layout.model.forward_calls[:3] == [(4, None), (4, 1), (4, 2)]

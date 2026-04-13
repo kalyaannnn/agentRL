@@ -223,6 +223,16 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
 
         generation_model = self.layout.model
         generation_model.config.use_cache = True
+        use_chunked_prefill = input_ids.shape[-1] > self.config.prefill_chunk_size
+        if use_chunked_prefill:
+            with torch.no_grad():
+                response_ids = self._generate_with_chunked_prefill(
+                    generation_model,
+                    input_ids,
+                    attention_mask,
+                )
+            return self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+
         generate_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -238,6 +248,48 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         prompt_length = input_ids.shape[-1]
         response_ids = generated[:, prompt_length:]
         return self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
+
+    def _generate_with_chunked_prefill(
+        self,
+        generation_model: Any,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate tokens by chunk-prefilling the prompt, then decoding autoregressively."""
+
+        next_token_logits, past_key_values = self.chunked_prefill_for_generation(
+            model=generation_model,
+            prompt_ids=input_ids,
+            chunk_size=self.config.prefill_chunk_size,
+            attention_mask=attention_mask,
+        )
+        generated_tokens: list[torch.Tensor] = []
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        for _ in range(self.config.max_new_tokens):
+            next_token = self._sample_next_token(next_token_logits)
+            generated_tokens.append(next_token)
+            if eos_token_id is not None and bool((next_token == eos_token_id).all().item()):
+                break
+            outputs = generation_model(
+                input_ids=next_token.unsqueeze(-1),
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_token_logits = outputs.logits[:, -1, :]
+
+        if not generated_tokens:
+            return torch.empty((input_ids.shape[0], 0), dtype=torch.long, device=self.device)
+        return torch.stack(generated_tokens, dim=1)
+
+    def _sample_next_token(self, next_token_logits: torch.Tensor) -> torch.Tensor:
+        """Sample or greedily decode the next token from final-step logits."""
+
+        if self.config.do_sample and self.config.temperature > 0:
+            probs = torch.softmax(next_token_logits / self.config.temperature, dim=-1)
+            return torch.multinomial(probs, num_samples=1, generator=self.rng).squeeze(-1)
+        return torch.argmax(next_token_logits, dim=-1)
 
     def _pack_sequences(
         self,

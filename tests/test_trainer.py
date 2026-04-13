@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -40,6 +41,7 @@ class TrainableLayout:
         self.model.config = SimpleNamespace(use_cache=False)
         self.logit_scale = torch.nn.Parameter(torch.tensor(0.0))
         self.ref_bias = 0.25
+        self.saved_adapters = []
 
     def trainable_parameters(self):
         yield self.logit_scale
@@ -59,6 +61,15 @@ class TrainableLayout:
         logits = torch.zeros((batch, seq, vocab), dtype=torch.float32)
         logits[:, :, 1] = self.ref_bias
         return logits
+
+    def save_adapter(self, path):
+        output = Path(path)
+        output.mkdir(parents=True, exist_ok=True)
+        self.saved_adapters.append(output)
+        return output
+
+    def vram_report(self) -> dict[str, float]:
+        return {"base_mb": 10.0, "adapter_mb": 1.5, "total_mb": 11.5}
 
 
 class StaticRollout:
@@ -153,3 +164,76 @@ def test_trainer_closes_metrics_logger_after_train() -> None:
 
     assert logger.closed is True
     assert len(logger.rows) == 1
+
+
+def test_trainer_saves_periodic_and_final_adapters(tmp_path) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        steps=2,
+        save_every=1,
+        output_dir=str(tmp_path),
+        use_continuous_batching=False,
+    )
+    batch = RolloutBatch(
+        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
+        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
+        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
+        policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
+        ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
+        rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+        advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
+        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
+    )
+    layout = TrainableLayout()
+    trainer = GRPOTrainer(
+        config=config,
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        tokenizer=DummyTokenizer(),
+        layout=layout,
+        rollout_orchestrator=StaticRollout(batch),
+        metrics_logger=ClosingLogger(),
+    )
+
+    trainer.train()
+
+    saved_names = [path.name for path in layout.saved_adapters]
+    assert saved_names == [
+        "checkpoint_000001",
+        "checkpoint_000002",
+        "checkpoint_final",
+    ]
+
+
+def test_trainer_exposes_startup_vram_report() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        steps=1,
+    )
+    trainer = GRPOTrainer(
+        config=config,
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        tokenizer=DummyTokenizer(),
+        layout=TrainableLayout(),
+        rollout_orchestrator=StaticRollout(
+            RolloutBatch(
+                input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2]]], dtype=torch.long),
+                attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1]]], dtype=torch.long),
+                action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
+                policy_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
+                ref_logprobs=torch.zeros((1, 2, 3), dtype=torch.float32),
+                rewards=torch.tensor([[1.0, 0.0]], dtype=torch.float32),
+                advantages=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
+                metadata={"unique_response_ratio": 1.0, "responses": [["x", "y"]]},
+            )
+        ),
+    )
+
+    assert trainer.startup_report["device"] == "cpu"
+    assert trainer.startup_report["parameter_total_mb"] == 11.5
+    assert trainer.startup_report["runtime_headroom_mb"] is None

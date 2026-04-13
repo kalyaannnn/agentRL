@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass
 from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -94,6 +95,8 @@ class GRPOTrainer:
             eps=self.config.adam_eps,
             weight_decay=self.config.weight_decay,
         )
+        self.startup_report = self._build_startup_report()
+        self._log_startup_report()
 
     def train(self) -> list[dict[str, float]]:
         """Run the configured GRPO training loop."""
@@ -131,7 +134,10 @@ class GRPOTrainer:
                     self.debugger.capture(step, batch, merged_metrics)
                 metrics_with_step = {"step": float(step), **merged_metrics}
                 history.append(metrics_with_step)
+                if (step + 1) % self.config.save_every == 0:
+                    self._save_adapter_checkpoint(step + 1)
         finally:
+            self._save_adapter_checkpoint(self.config.steps, suffix="final")
             self.metrics_logger.close()
         return history
 
@@ -378,3 +384,82 @@ class GRPOTrainer:
             self.config.chunk_size = compute_safe_chunk_size(self.config, model_config)
         except (AttributeError, ValueError):
             return
+
+    def _save_adapter_checkpoint(self, step: int, suffix: str | None = None) -> Path | None:
+        """Persist the current LoRA adapter state when the layout supports it."""
+
+        save_adapter = getattr(self.layout, "save_adapter", None)
+        if save_adapter is None:
+            LOGGER.warning("Layout does not expose save_adapter(); skipping adapter checkpoint save.")
+            return None
+
+        checkpoint_name = (
+            f"{self.config.checkpoint_prefix}_{suffix}"
+            if suffix is not None
+            else f"{self.config.checkpoint_prefix}_{step:06d}"
+        )
+        output_path = self.config.output_path / checkpoint_name
+        saved_path = save_adapter(output_path)
+        LOGGER.info("Saved adapter checkpoint: %s", saved_path)
+        return Path(saved_path)
+
+    def _build_startup_report(self) -> dict[str, float | str | None]:
+        """Collect one startup snapshot of parameter VRAM and live device headroom."""
+
+        report: dict[str, float | str | None] = {
+            "device": self.device.type,
+            "device_name": str(self.device),
+        }
+
+        vram_report = getattr(self.layout, "vram_report", None)
+        if vram_report is not None:
+            report.update({
+                f"parameter_{key}": float(value)
+                for key, value in vram_report().items()
+            })
+
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            report.update(
+                {
+                    "device_total_mb": None,
+                    "device_free_mb": None,
+                    "device_allocated_mb": None,
+                    "device_reserved_mb": None,
+                    "runtime_headroom_mb": None,
+                }
+            )
+            return report
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        report.update(
+            {
+                "device_total_mb": total_bytes / (1024 * 1024),
+                "device_free_mb": free_bytes / (1024 * 1024),
+                "device_allocated_mb": torch.cuda.memory_allocated(self.device) / (1024 * 1024),
+                "device_reserved_mb": torch.cuda.memory_reserved(self.device) / (1024 * 1024),
+                "runtime_headroom_mb": free_bytes / (1024 * 1024),
+            }
+        )
+        return report
+
+    def _log_startup_report(self) -> None:
+        """Emit a concise startup device and memory summary."""
+
+        report = self.startup_report
+        LOGGER.info(
+            "startup device=%s | parameter_total_mb=%s | free_mb=%s | reserved_mb=%s | allocated_mb=%s",
+            report.get("device_name"),
+            self._format_optional_metric(report.get("parameter_total_mb")),
+            self._format_optional_metric(report.get("device_free_mb")),
+            self._format_optional_metric(report.get("device_reserved_mb")),
+            self._format_optional_metric(report.get("device_allocated_mb")),
+        )
+
+    def _format_optional_metric(self, value: float | str | None) -> str:
+        """Format optional numeric metrics for startup logging."""
+
+        if value is None:
+            return "n/a"
+        if isinstance(value, float):
+            return f"{value:.1f}"
+        return str(value)

@@ -61,3 +61,51 @@ class ChunkedPrefillMixin:
             )
             past_key_values = outputs.past_key_values
         return past_key_values
+
+    def chunked_prefill_for_generation(
+        self,
+        model: Any,
+        prompt_ids: torch.Tensor,
+        chunk_size: int = 512,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, Any]:
+        """Run prompt prefill in chunks and return final-step logits plus KV state.
+
+        This is the generation-oriented companion to `chunked_prefill()`. The
+        last-chunk logits let callers sample the first autoregressive token
+        without re-running the entire prompt in one monolithic prefill pass.
+        """
+
+        if prompt_ids.shape[-1] <= chunk_size:
+            outputs = model(
+                input_ids=prompt_ids,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+            return outputs.logits[:, -1, :], outputs.past_key_values
+
+        chunk_count = (prompt_ids.shape[-1] + chunk_size - 1) // chunk_size
+        LOGGER.info(
+            "Chunked prefill: prompt_len=%s, chunks=%s",
+            prompt_ids.shape[-1],
+            chunk_count,
+        )
+
+        past_key_values = None
+        final_logits = None
+        for start in range(0, prompt_ids.shape[-1], chunk_size):
+            end = start + chunk_size
+            chunk_ids = prompt_ids[:, start:end]
+            chunk_mask = attention_mask[:, start:end] if attention_mask is not None else None
+            outputs = model(
+                input_ids=chunk_ids,
+                attention_mask=chunk_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            final_logits = outputs.logits[:, -1, :]
+
+        if final_logits is None:
+            raise RuntimeError("chunked_prefill_for_generation produced no logits.")
+        return final_logits, past_key_values
