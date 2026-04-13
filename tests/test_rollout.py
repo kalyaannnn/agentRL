@@ -185,6 +185,11 @@ def test_rollout_collects_multi_turn_grouped_batch() -> None:
     assert batch.advantages[0, 1].item() == pytest.approx(-1.0, rel=1e-5)
     assert batch.action_mask.sum().item() > 0
     assert batch.metadata["responses"] == [["done", "bad"]]
+    assert batch.metadata["prefill_tokens"] > 0.0
+    assert batch.metadata["decode_tokens"] > 0.0
+    assert "prefill_tokens_per_second" in batch.metadata
+    assert "decode_tokens_per_second" in batch.metadata
+    assert "padding_waste_tokens" in batch.metadata
 
 
 def test_rollout_warns_when_episode_hits_turn_cap(caplog: pytest.LogCaptureFixture) -> None:
@@ -260,5 +265,9 @@ def test_rollout_uses_chunked_prefill_for_long_prompts() -> None:
     batch = orchestrator.collect()
 
     assert batch.metadata["responses"] == [["ok", "ok"]]
+    assert batch.metadata["prefill_time_ms"] >= 0.0
+    assert batch.metadata["decode_time_ms"] >= 0.0
+    assert batch.metadata["cache_reuse_tokens"] > 0.0
+    assert batch.metadata["cache_reuse_effectiveness"] > 0.0
     assert layout.model.generate_called is False
     assert layout.model.forward_calls[:3] == [(4, None), (4, 1), (4, 2)]

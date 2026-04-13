@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -62,6 +63,7 @@ class GRPOTrainer:
         self.environment = environment
         self.verifier = verifier
         self._set_seed()
+        self._validate_experimental_flags()
         self.tokenizer = tokenizer or self._build_tokenizer()
         self.layout = layout or self._build_layout()
         self.device = self._resolve_device()
@@ -95,8 +97,26 @@ class GRPOTrainer:
             eps=self.config.adam_eps,
             weight_decay=self.config.weight_decay,
         )
+        self.scheduler = self._build_lr_scheduler()
+        self.current_beta = float(self.config.beta)
         self.startup_report = self._build_startup_report()
         self._log_startup_report()
+
+    def _validate_experimental_flags(self) -> None:
+        """Reject experimental runtime flags that are not implemented yet."""
+
+        if self.config.use_async_rollout_workers:
+            raise NotImplementedError(
+                "use_async_rollout_workers is reserved for a future CPU worker path and is not implemented yet."
+            )
+        if self.config.use_async_trajectory_copy:
+            raise NotImplementedError(
+                "use_async_trajectory_copy is reserved for a future pinned-memory copy path and is not implemented yet."
+            )
+        if self.config.experimental_vllm_rollout:
+            raise NotImplementedError(
+                "experimental_vllm_rollout is reserved for a future optional vLLM rollout path and is not implemented yet."
+            )
 
     def train(self) -> list[dict[str, float]]:
         """Run the configured GRPO training loop."""
@@ -108,15 +128,14 @@ class GRPOTrainer:
 
         try:
             for step in range(self.config.steps):
+                should_step = (
+                    ((step + 1) % self.config.gradient_accumulation_steps == 0)
+                    or step == self.config.steps - 1
+                )
                 with self.profiler as prof:
-                    with prof.phase("generation"):
-                        batch = self.rollout.collect()
-                    with prof.phase("training"):
-                        should_step = (
-                            ((step + 1) % self.config.gradient_accumulation_steps == 0)
-                            or step == self.config.steps - 1
-                        )
-                        _, metrics = self.step(batch, perform_optimizer_step=should_step)
+                    self._run_profiled_step(step=step, profiler=prof, should_step=should_step)
+                    batch = self._last_profiled_batch
+                    metrics = self._last_profiled_metrics
 
                 self.trajectory_buffer.add(batch, step=step)
                 if step % self.config.replay_every == 0:
@@ -189,6 +208,7 @@ class GRPOTrainer:
         flat_advantages = batch.advantages.reshape(-1)
 
         autocast_context = self._autocast_context()
+        current_lr = self._current_learning_rate()
         with autocast_context:
             policy_logits = self.layout.policy_forward(
                 input_ids=flat_input_ids,
@@ -207,10 +227,11 @@ class GRPOTrainer:
             )
             masked_action = flat_action_mask[:, 1:].to(dtype=policy_logits.dtype)
             sequence_delta = ((token_logprobs - token_ref_logprobs) * masked_action).sum(dim=-1)
+            action_token_count = masked_action.sum().clamp(min=1.0)
+            mean_token_kl = (token_kl * masked_action).sum() / action_token_count
 
             policy_loss = -(flat_advantages * sequence_delta).mean()
-            action_token_count = masked_action.sum().clamp(min=1.0)
-            kl_loss = self.config.beta * (token_kl * masked_action).sum() / action_token_count
+            kl_loss = self.current_beta * mean_token_kl
             total_loss = policy_loss + kl_loss
 
         scaled_loss = total_loss / float(self.config.gradient_accumulation_steps)
@@ -219,8 +240,14 @@ class GRPOTrainer:
         if perform_optimizer_step:
             torch.nn.utils.clip_grad_norm_(list(self.layout.trainable_parameters()), self.config.max_grad_norm)
             self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
+            if self.config.use_adaptive_kl:
+                self._update_beta(float(mean_token_kl.detach().item()))
 
-        metrics = self._build_metrics(batch, policy_loss, kl_loss, total_loss)
+        metrics = self._build_metrics(batch, policy_loss, kl_loss, total_loss, mean_token_kl)
+        metrics["learning_rate"] = current_lr
+        metrics["beta"] = self.current_beta
         self._log_degenerate_batch_warnings(batch, metrics)
         return total_loss.detach(), metrics
 
@@ -248,6 +275,7 @@ class GRPOTrainer:
         policy_loss: torch.Tensor,
         kl_loss: torch.Tensor,
         total_loss: torch.Tensor,
+        mean_token_kl: torch.Tensor,
     ) -> dict[str, float]:
         """Collect scalar metrics required by the GRPO contract."""
 
@@ -256,11 +284,110 @@ class GRPOTrainer:
             "reward_std": float(batch.rewards.std(unbiased=False).item()),
             "policy_loss": float(policy_loss.detach().item()),
             "kl_loss": float(kl_loss.detach().item()),
+            "mean_token_kl": float(mean_token_kl.detach().item()),
             "total_loss": float(total_loss.detach().item()),
             "advantage_mean": float(batch.advantages.mean().item()),
             "advantage_std": float(batch.advantages.std(unbiased=False).item()),
             "unique_response_ratio": float(batch.metadata.get("unique_response_ratio", 0.0)),
         }
+
+    def _build_lr_scheduler(self):
+        """Construct the configured learning-rate scheduler."""
+
+        if self.config.lr_scheduler == "constant":
+            return torch.optim.lr_scheduler.LambdaLR(
+                self.optimizer,
+                lr_lambda=self._constant_lr_lambda,
+            )
+        return torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=self._cosine_lr_lambda,
+        )
+
+    def _constant_lr_lambda(self, step: int) -> float:
+        """Return the LR multiplier for constant-with-warmup scheduling."""
+
+        if step <= 0:
+            return 1.0
+        if self.config.warmup_steps <= 0:
+            return 1.0
+        if step < self.config.warmup_steps:
+            return float(step) / float(self.config.warmup_steps)
+        return 1.0
+
+    def _cosine_lr_lambda(self, step: int) -> float:
+        """Return the LR multiplier for cosine decay with optional warmup."""
+
+        if step <= 0:
+            return 1.0
+        if self.config.warmup_steps > 0 and step < self.config.warmup_steps:
+            return float(step) / float(self.config.warmup_steps)
+
+        decay_steps = max(self.config.steps - self.config.warmup_steps, 1)
+        progress = min(max(step - self.config.warmup_steps, 0), decay_steps) / float(decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(progress * math.pi))
+        return self.config.min_lr_ratio + (1.0 - self.config.min_lr_ratio) * cosine
+
+    def _current_learning_rate(self) -> float:
+        """Return the active optimizer learning rate."""
+
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    def _update_beta(self, mean_token_kl: float) -> None:
+        """Apply a bounded multiplicative update toward the configured KL target."""
+
+        if self.config.kl_target is None:
+            return
+        if mean_token_kl > self.config.kl_target:
+            self.current_beta = min(self.current_beta * self.config.kl_beta_multiplier, self.config.max_beta)
+        elif mean_token_kl < self.config.kl_target:
+            self.current_beta = max(self.current_beta / self.config.kl_beta_multiplier, self.config.min_beta)
+
+    def _run_profiled_step(self, step: int, profiler: SystemsProfiler, should_step: bool) -> None:
+        """Run one train step, optionally exporting a torch profiler trace."""
+
+        self._last_profiled_batch = None
+        self._last_profiled_metrics = None
+        if self.config.profile_steps is None or step >= self.config.profile_steps:
+            with profiler.phase("generation"):
+                batch = self.rollout.collect()
+            with profiler.phase("training"):
+                _, metrics = self.step(batch, perform_optimizer_step=should_step)
+            self._last_profiled_batch = batch
+            self._last_profiled_metrics = metrics
+            return
+
+        try:
+            from torch.profiler import ProfilerActivity, profile
+        except ImportError:
+            LOGGER.warning("torch.profiler is unavailable; skipping profile export for step %s", step)
+            with profiler.phase("generation"):
+                batch = self.rollout.collect()
+            with profiler.phase("training"):
+                _, metrics = self.step(batch, perform_optimizer_step=should_step)
+            self._last_profiled_batch = batch
+            self._last_profiled_metrics = metrics
+            return
+
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+
+        self.config.profile_path.mkdir(parents=True, exist_ok=True)
+        trace_path = self.config.profile_path / f"step_{step:06d}_chrome_trace.json"
+        with profile(
+            activities=activities,
+            record_shapes=True,
+            with_stack=True,
+        ) as torch_profiler:
+            with profiler.phase("generation"):
+                batch = self.rollout.collect()
+            with profiler.phase("training"):
+                _, metrics = self.step(batch, perform_optimizer_step=should_step)
+        torch_profiler.export_chrome_trace(str(trace_path))
+        metrics["profile_trace_path"] = str(trace_path)
+        self._last_profiled_batch = batch
+        self._last_profiled_metrics = metrics
 
     def _log_degenerate_batch_warnings(
         self,

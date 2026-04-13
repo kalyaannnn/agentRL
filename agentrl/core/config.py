@@ -24,6 +24,9 @@ class GRPOConfig:
     max_new_tokens: int = 512
     beta: float = 0.01
     lr: float = 1e-5
+    lr_scheduler: str = "constant"
+    warmup_steps: int = 0
+    min_lr_ratio: float = 0.0
     steps: int = 500
     use_lora: bool = True
     lora_r: int = 16
@@ -62,6 +65,13 @@ class GRPOConfig:
     wandb_project: str | None = None
     wandb_run_name: str | None = None
     reward_histogram_every: int = 10
+    profile_steps: int | None = None
+    profile_dir: str = "./profiles"
+    use_adaptive_kl: bool = False
+    kl_target: float | None = None
+    kl_beta_multiplier: float = 1.5
+    min_beta: float = 1e-4
+    max_beta: float = 1.0
     replay_every: int = 50
     save_every: int = 100
     output_dir: str = "./checkpoints"
@@ -78,7 +88,14 @@ class GRPOConfig:
     max_grad_norm: float = 1.0
     pad_to_multiple_of: int | None = 8
     trajectory_buffer_max_batches: int = 8
+    use_async_rollout_workers: bool = False
+    async_rollout_num_workers: int = 2
+    async_rollout_queue_size: int = 4
+    use_async_trajectory_copy: bool = False
+    async_trajectory_max_pending_batches: int = 2
+    experimental_vllm_rollout: bool = False
     _output_path: Path = field(init=False, repr=False)
+    _profile_path: Path = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate config invariants that later components depend on."""
@@ -97,6 +114,9 @@ class GRPOConfig:
         self._validate_positive_int("replay_every", self.replay_every)
         self._validate_positive_int("save_every", self.save_every)
         self._validate_positive_int("trajectory_buffer_max_batches", self.trajectory_buffer_max_batches)
+        self._validate_positive_int("async_rollout_num_workers", self.async_rollout_num_workers)
+        self._validate_positive_int("async_rollout_queue_size", self.async_rollout_queue_size)
+        self._validate_positive_int("async_trajectory_max_pending_batches", self.async_trajectory_max_pending_batches)
 
         self._validate_probability("beta", self.beta, allow_one=True)
         self._validate_probability("lora_dropout", self.lora_dropout, allow_one=True)
@@ -105,6 +125,12 @@ class GRPOConfig:
 
         if self.lr <= 0:
             raise ConfigurationError("lr must be > 0.")
+        if self.lr_scheduler not in {"constant", "cosine"}:
+            raise ConfigurationError("lr_scheduler must be one of: constant, cosine.")
+        if self.warmup_steps < 0:
+            raise ConfigurationError("warmup_steps must be >= 0.")
+        if not (0.0 <= self.min_lr_ratio <= 1.0):
+            raise ConfigurationError("min_lr_ratio must satisfy 0.0 <= min_lr_ratio <= 1.0.")
         if self.clip_range <= 0:
             raise ConfigurationError("clip_range must be > 0.")
         if self.temperature < 0:
@@ -125,6 +151,16 @@ class GRPOConfig:
             raise ConfigurationError("weight_decay must be >= 0.")
         if self.adam_eps <= 0:
             raise ConfigurationError("adam_eps must be > 0.")
+        if self.profile_steps is not None and self.profile_steps < 0:
+            raise ConfigurationError("profile_steps must be >= 0 when provided.")
+        if self.kl_target is not None and self.kl_target <= 0:
+            raise ConfigurationError("kl_target must be > 0 when provided.")
+        if self.kl_beta_multiplier <= 1.0:
+            raise ConfigurationError("kl_beta_multiplier must be > 1.0.")
+        if self.min_beta <= 0 or self.max_beta <= 0:
+            raise ConfigurationError("min_beta and max_beta must be > 0.")
+        if self.min_beta > self.max_beta:
+            raise ConfigurationError("min_beta must be <= max_beta.")
         if not self.lora_target_modules:
             raise ConfigurationError("lora_target_modules must contain at least one module name.")
         if self.dtype not in {"float16", "bfloat16", "float32"}:
@@ -150,14 +186,23 @@ class GRPOConfig:
             )
         if self.log_to_wandb and not self.wandb_project:
             raise ConfigurationError("log_to_wandb=True requires wandb_project.")
+        if self.use_adaptive_kl and self.kl_target is None:
+            raise ConfigurationError("use_adaptive_kl=True requires kl_target.")
 
         self._output_path = Path(self.output_dir).expanduser()
+        self._profile_path = Path(self.profile_dir).expanduser()
 
     @property
     def output_path(self) -> Path:
         """Return the normalized output directory path."""
 
         return self._output_path
+
+    @property
+    def profile_path(self) -> Path:
+        """Return the normalized profile output directory path."""
+
+        return self._profile_path
 
     def rollout_generation_kwargs(self) -> dict[str, float | bool]:
         """Return generation kwargs for exploratory rollout sampling."""

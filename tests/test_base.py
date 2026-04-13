@@ -48,6 +48,9 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.max_new_tokens == 512
     assert config.beta == 0.01
     assert config.lr == 1e-5
+    assert config.lr_scheduler == "constant"
+    assert config.warmup_steps == 0
+    assert config.min_lr_ratio == 0.0
     assert config.steps == 500
     assert config.use_lora is True
     assert config.use_gradient_checkpointing is False
@@ -55,6 +58,12 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.use_speculative_decoding is False
     assert config.max_episode_steps == 8
     assert config.output_path.name == "checkpoints"
+    assert config.profile_steps is None
+    assert config.profile_path.name == "profiles"
+    assert config.use_adaptive_kl is False
+    assert config.use_async_rollout_workers is False
+    assert config.use_async_trajectory_copy is False
+    assert config.experimental_vllm_rollout is False
     assert config.top_p == 1.0
     assert config.stop_strings == ()
 
@@ -78,6 +87,16 @@ def test_config_rejects_wandb_without_project() -> None:
             model_name="Qwen/Qwen2.5-1.5B-Instruct",
             log_to_wandb=True,
         )
+
+
+def test_config_rejects_invalid_lr_scheduler() -> None:
+    with pytest.raises(ConfigurationError, match="lr_scheduler"):
+        GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", lr_scheduler="linear")
+
+
+def test_config_requires_kl_target_for_adaptive_kl() -> None:
+    with pytest.raises(ConfigurationError, match="kl_target"):
+        GRPOConfig(model_name="Qwen/Qwen2.5-1.5B-Instruct", use_adaptive_kl=True)
 
 
 def test_config_rejects_invalid_max_episode_steps() -> None:

@@ -117,5 +117,7 @@ def test_profiler_reports_phase_table_and_metrics() -> None:
 
     assert "Phase          Time (ms)" in report
     assert "generation_time_ms" in metrics
+    assert "generation_peak_vram_mb" in metrics
+    assert "generation_runtime_headroom_mb" in metrics
     assert "training_time_ms" in metrics
     assert metrics["total_step_time_ms"] >= 0.0

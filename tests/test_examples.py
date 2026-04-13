@@ -6,8 +6,9 @@ from types import SimpleNamespace
 
 from examples.bootstrap_gsm8k_subset import main as bootstrap_gsm8k_main
 from examples.benchmark_gsm8k_subset import main as benchmark_gsm8k_main
+from examples.benchmark_systems import main as benchmark_systems_main
 from examples.eval_gsm8k_subset import main as eval_gsm8k_main
-from examples import benchmark_gsm8k_subset, bootstrap_gsm8k_subset, eval_gsm8k_subset, train_math
+from examples import benchmark_gsm8k_subset, benchmark_systems, bootstrap_gsm8k_subset, eval_gsm8k_subset, train_math
 from examples.gsm8k_subset import (
     GSM8KProblem,
     GSM8KSubsetEnvironment,
@@ -76,7 +77,7 @@ def test_train_math_uses_public_api_shape(monkeypatch) -> None:
     assert captured["config"].group_size == 4
     assert captured["config"].max_new_tokens == 32
     assert captured["config"].output_dir == "./artifacts"
-    assert captured["config"].use_continuous_batching is False
+    assert captured["config"].use_continuous_batching is True
     assert captured["environment"].split == "eval"
     assert captured["verifier"].__class__.__name__ == "MathVerifier"
     assert captured["trained"] is True
@@ -341,7 +342,7 @@ def test_benchmark_gsm8k_subset_uses_public_api_shape(monkeypatch) -> None:
     assert captured["config"].init_adapter_path == "./adapter"
     assert captured["config"].temperature == 0.8
     assert captured["config"].top_p == 0.95
-    assert captured["config"].use_continuous_batching is False
+    assert captured["config"].use_continuous_batching is True
     assert captured["config"].stop_strings == ("\nHuman:",)
     assert captured["environment"].split == "test"
     assert captured["environment"].subset_size == 16
@@ -451,6 +452,65 @@ def test_bootstrap_gsm8k_subset_uses_public_api_shape(monkeypatch, tmp_path) -> 
     assert captured["bootstrap_tokenizer"] is captured["tokenizer"]
 
 
+def test_benchmark_systems_writes_summary(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            captured["config"] = config
+            captured["environment"] = environment
+            captured["verifier"] = verifier
+
+        def train(self):
+            return [
+                {
+                    "total_step_time_ms": 100.0,
+                    "generation_time_ms": 60.0,
+                    "training_time_ms": 40.0,
+                    "tokens_per_second": 20.0,
+                    "prefill_tokens_per_second": 30.0,
+                    "decode_tokens_per_second": 15.0,
+                    "padding_ratio": 0.1,
+                    "generation_padding_ratio": 0.2,
+                    "sequence_padding_ratio": 0.05,
+                    "cache_reuse_effectiveness": 0.7,
+                    "peak_vram_mb": 123.0,
+                    "rollout_peak_vram_mb": 111.0,
+                    "rollout_runtime_headroom_mb": 456.0,
+                }
+            ]
+
+    monkeypatch.setattr(benchmark_systems, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_systems.py",
+            "--model",
+            "fake/model",
+            "--steps",
+            "2",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "4",
+            "--max-new-tokens",
+            "16",
+            "--split",
+            "easy",
+            "--output-dir",
+            str(tmp_path / "systems"),
+        ],
+    )
+
+    benchmark_systems_main()
+
+    summary = (tmp_path / "systems" / "summary.json").read_text(encoding="utf-8")
+    assert '"mean_step_time_ms": 100.0' in summary
+    assert '"mean_generation_fraction": 0.6' in summary
+    assert '"mean_cache_reuse_effectiveness": 0.7' in summary
+
+
 def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
     class StubEnvironment:
         dataset_name = "gsm8k"
@@ -481,6 +541,12 @@ def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
         def verify(self, response, env_state):
             del env_state
             return 1.0 if response.strip() == "Final answer: 4" else 0.0
+
+        @staticmethod
+        def extract_terminal_final_answer(response):
+            if response.strip() == "Final answer: 4":
+                return 4
+            return None
 
     class StubTokenizer:
         pad_token_id = 0
@@ -564,5 +630,150 @@ def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:
     predictions = (tmp_path / "eval" / "predictions.jsonl").read_text(encoding="utf-8")
 
     assert '"exact_match_rate": 1.0' in summary
+    assert '"pass_at_1": 1.0' in summary
     assert '"subset_size": 1' in summary
     assert '"reward": 1.0' in predictions
+    assert '"sampled_responses": ["Final answer: 4"]' in predictions
+
+
+def test_eval_gsm8k_subset_reports_pass_at_k(monkeypatch, tmp_path) -> None:
+    class StubEnvironment:
+        dataset_name = "gsm8k"
+        dataset_config_name = "main"
+
+        def __init__(self, split, subset_size, max_question_words, curriculum):
+            self.split = split
+            self.subset_size = subset_size
+            self.max_question_words = max_question_words
+            self.curriculum = curriculum
+
+        def problems(self):
+            return [GSM8KProblem("What is 2 + 2?", 4, "2 + 2 = 4\n#### 4")]
+
+        @staticmethod
+        def render_prompt(tokenizer, question):
+            del tokenizer
+            return f"Prompt: {question}"
+
+        @staticmethod
+        def postprocess_response(response):
+            return response
+
+    class StubVerifier:
+        def __init__(self, reward_mode):
+            self.reward_mode = reward_mode
+
+        def verify(self, response, env_state):
+            del env_state
+            return 1.0 if response.strip() == "Final answer: 4" else 0.0
+
+        @staticmethod
+        def extract_terminal_final_answer(response):
+            if response.strip() == "Final answer: 4":
+                return 4
+            return None
+
+    class StubTokenizer:
+        pad_token_id = 0
+        eos_token_id = 99
+        eos_token = "<eos>"
+
+        def __call__(self, prompt, return_tensors, add_special_tokens):
+            del prompt, return_tensors, add_special_tokens
+            import torch
+
+            return {
+                "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            }
+
+        def decode(self, response_ids, skip_special_tokens):
+            del skip_special_tokens
+            mapping = {
+                (3,): "wrong",
+                (4,): "Final answer: 4",
+                (5,): "still wrong",
+            }
+            return mapping[tuple(int(token) for token in response_ids.tolist())]
+
+    class StubModel:
+        config = SimpleNamespace(use_cache=False)
+
+        def eval(self):
+            return None
+
+        def generate(self, **kwargs):
+            import torch
+
+            assert kwargs["num_return_sequences"] == 3
+            assert kwargs["do_sample"] is True
+            return torch.tensor(
+                [
+                    [1, 2, 3],
+                    [1, 2, 4],
+                    [1, 2, 5],
+                ],
+                dtype=torch.long,
+            )
+
+    class StubLayout:
+        def __init__(self, **kwargs):
+            self.device = "cpu"
+            self.model = StubModel()
+
+    monkeypatch.setattr(eval_gsm8k_subset, "GSM8KSubsetEnvironment", StubEnvironment)
+    monkeypatch.setattr(eval_gsm8k_subset, "GSM8KSubsetVerifier", StubVerifier)
+    monkeypatch.setattr(eval_gsm8k_subset, "SharedWeightLayout", StubLayout)
+    monkeypatch.setitem(
+        sys.modules,
+        "peft",
+        SimpleNamespace(LoraConfig=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoTokenizer=SimpleNamespace(
+                from_pretrained=lambda *args, **kwargs: StubTokenizer()
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_gsm8k_subset.py",
+            "--model",
+            "fake/model",
+            "--init-adapter-path",
+            "./adapter",
+            "--output-dir",
+            str(tmp_path / "eval"),
+            "--split",
+            "train",
+            "--subset-size",
+            "16",
+            "--max-question-words",
+            "50",
+            "--curriculum",
+            "easy",
+            "--max-new-tokens",
+            "96",
+            "--num-samples",
+            "3",
+            "--pass-k",
+            "2",
+        ],
+    )
+
+    eval_gsm8k_main()
+
+    summary = (tmp_path / "eval" / "summary.json").read_text(encoding="utf-8")
+    predictions = (tmp_path / "eval" / "predictions.jsonl").read_text(encoding="utf-8")
+
+    assert '"pass_at_1": 0.0' in summary
+    assert '"pass_at_k": 1.0' in summary
+    assert '"fraction_with_any_correct": 1.0' in summary
+    assert '"mean_reward": 0.3333333333333333' in summary
+    assert '"parsed_predictions": [null, 4, null]' in predictions
+    assert '"rewards": [0.0, 1.0, 0.0]' in predictions

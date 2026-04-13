@@ -3,10 +3,16 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 from agentrl.core.config import GRPOConfig
 from agentrl.generation.continuous import ContinuousBatchingOrchestrator
+
+try:
+    from transformers.cache_utils import DynamicCache
+except ImportError:  # pragma: no cover - transformers is a required dependency in normal test runs
+    DynamicCache = None
 
 
 class CharTokenizer:
@@ -148,6 +154,54 @@ class ChunkedLayout:
         return torch.zeros((batch, seq, 256), dtype=torch.float32)
 
 
+class DynamicCacheStepModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(use_cache=False)
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: DynamicCache | None = None,
+        use_cache: bool = True,
+    ) -> SimpleNamespace:
+        del attention_mask, use_cache
+        past_length = 0 if past_key_values is None else int(past_key_values.get_seq_length())
+
+        vocab = 256
+        logits = torch.full((input_ids.shape[0], input_ids.shape[1], vocab), -1e9, dtype=torch.float32)
+        if past_length == 0:
+            logits[:, -1, ord("a")] = 0.0
+        else:
+            next_tokens = torch.where(input_ids[:, -1] == ord("a"), ord("b"), 3)
+            logits[torch.arange(input_ids.shape[0]), -1, next_tokens] = 0.0
+
+        new_length = past_length + input_ids.shape[-1]
+        key = torch.zeros((input_ids.shape[0], 1, new_length, 1), dtype=torch.float32)
+        value = torch.zeros((input_ids.shape[0], 1, new_length, 1), dtype=torch.float32)
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=DynamicCache.from_legacy_cache(((key, value),)),
+        )
+
+
+class DynamicCacheLayout:
+    def __init__(self) -> None:
+        self.model = DynamicCacheStepModel()
+
+    def policy_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+
 def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -169,6 +223,10 @@ def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     assert batch.rewards.tolist() == [[1.0, 1.0]]
     assert "padding_ratio" in batch.metadata
     assert 0.0 <= batch.metadata["padding_ratio"] <= 1.0
+    assert "prefill_time_ms" in batch.metadata
+    assert "decode_time_ms" in batch.metadata
+    assert "decode_tokens_per_second" in batch.metadata
+    assert "cache_reuse_effectiveness" in batch.metadata
 
 
 def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
@@ -192,8 +250,71 @@ def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
     batch = orchestrator.collect()
 
     assert batch.metadata["responses"] == [["ab", "ab"]]
+    assert batch.metadata["prefill_tokens"] > 0.0
+    assert batch.metadata["decode_tokens"] > 0.0
+    assert batch.metadata["cache_reuse_tokens"] > 0.0
     assert orchestrator.layout.model.prefill_calls[:3] == [(4, None), (4, 4), (4, 8)]
     first_decode, second_decode = orchestrator.layout.model.decode_calls[:2]
     assert first_decode[:2] == (2, 1)
     assert second_decode[:2] == (2, 1)
     assert second_decode[2] == first_decode[2] + 1
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_continuous_batching_stacks_and_splits_dynamic_cache() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=DynamicCacheLayout(),
+        device=torch.device("cpu"),
+    )
+
+    first = DynamicCache.from_legacy_cache(
+        ((torch.arange(3, dtype=torch.float32).view(1, 1, 3, 1), torch.zeros((1, 1, 3, 1))),)
+    )
+    second = DynamicCache.from_legacy_cache(
+        ((torch.arange(10, 13, dtype=torch.float32).view(1, 1, 3, 1), torch.ones((1, 1, 3, 1))),)
+    )
+
+    stacked = orchestrator._stack_past_key_values([first, second])
+    assert isinstance(stacked, DynamicCache)
+    assert tuple(stacked.to_legacy_cache()[0][0].shape) == (2, 1, 3, 1)
+
+    split = orchestrator._split_past_key_values(stacked, 2)
+    assert len(split) == 2
+    assert all(isinstance(item, DynamicCache) for item in split)
+    assert torch.equal(split[0].to_legacy_cache()[0][0], first.to_legacy_cache()[0][0])
+    assert torch.equal(split[1].to_legacy_cache()[0][0], second.to_legacy_cache()[0][0])
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_continuous_batching_collects_with_dynamic_cache_model() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=DynamicCacheLayout(),
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.rewards.tolist() == [[1.0, 1.0]]
+    assert batch.metadata["responses"] == [["ab", "ab"]]
