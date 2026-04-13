@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +42,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
     def collect(self) -> RolloutBatch:
         """Collect one rollout batch using continuous per-step scheduling."""
 
+        self._reset_runtime_stats()
         states: list[_EpisodeState] = []
         for _ in range(self.config.batch_size):
             root_env = self._clone_environment(self.environment)
@@ -139,7 +141,6 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         )
         advantages = self._compute_advantages(rewards)
         metadata = self._build_metadata(episode_dicts, rewards)
-        metadata["padding_ratio"] = float(sum(padding_ratios) / len(padding_ratios)) if padding_ratios else 0.0
 
         return RolloutBatch(
             input_ids=input_ids,
@@ -195,7 +196,10 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         generated_ids = [torch.empty(0, dtype=torch.long, device=self.device) for _ in prompt_ids]
         finished = [False for _ in prompt_ids]
         sequence_lengths = [int(mask.sum().item()) for mask in prompt_masks]
+        self._runtime_stats["prefill_tokens"] += float(sum(sequence_lengths))
+        prefill_start = time.perf_counter()
         sequence_caches, next_logits = self._prefill_prompt_caches(generation_model, prompt_ids, prompt_masks)
+        self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0
         next_logits_by_index = {
             index: next_logits[index : index + 1]
             for index in range(len(prompt_ids))
@@ -203,6 +207,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
 
         total_padding_tokens = 0
         total_step_tokens = 0
+        decode_start = time.perf_counter()
 
         for _ in range(self.config.max_new_tokens):
             active_indices = [index for index, is_finished in enumerate(finished) if not is_finished]
@@ -216,6 +221,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             for batch_offset, episode_index in enumerate(active_indices):
                 token_tensor = next_tokens[batch_offset : batch_offset + 1].to(dtype=torch.long, device=self.device)
                 generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
+                self._runtime_stats["decode_tokens"] += float(token_tensor.numel())
                 token = int(token_tensor.item())
                 if eos_token_id is not None and token == eos_token_id:
                     finished[episode_index] = True
@@ -228,6 +234,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             next_logits_by_index = {}
             for sequence_length, bucket in decode_buckets.items():
                 total_step_tokens += sequence_length * len(bucket)
+                self._runtime_stats["cache_reuse_tokens"] += float(sequence_length * len(bucket))
 
                 bucket_indices = [episode_index for episode_index, _token_tensor in bucket]
                 bucket_tokens = torch.stack([token_tensor for _episode_index, token_tensor in bucket], dim=0)
@@ -250,6 +257,9 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                     sequence_caches[episode_index] = split_cache[offset]
                     sequence_lengths[episode_index] += 1
                     next_logits_by_index[episode_index] = bucket_logits[offset : offset + 1]
+        self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0
+        self._runtime_stats["generation_padding_waste_tokens"] += float(total_padding_tokens)
+        self._runtime_stats["generation_padding_total_tokens"] += float(total_step_tokens)
 
         decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
@@ -265,11 +275,13 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         current_ids = [prompt.clone() for prompt in prompt_ids]
         generated_ids = [torch.empty(0, dtype=torch.long, device=self.device) for _ in prompt_ids]
         finished = [False for _ in prompt_ids]
+        self._runtime_stats["prefill_tokens"] += float(sum(int(mask.sum().item()) for mask in prompt_masks))
 
         total_padding_tokens = 0
         total_step_tokens = 0
 
         if any(prompt.numel() > self.config.prefill_chunk_size for prompt in prompt_ids):
+            prefill_start = time.perf_counter()
             generated_ids, current_ids, finished = self._prime_with_chunked_prefill(
                 prompt_ids=prompt_ids,
                 prompt_masks=prompt_masks,
@@ -277,7 +289,10 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 current_ids=current_ids,
                 finished=finished,
             )
+            self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0
+            self._runtime_stats["decode_tokens"] += float(sum(int(tokens.numel()) for tokens in generated_ids))
 
+        decode_start = time.perf_counter()
         for _ in range(self.config.max_new_tokens):
             active_indices = [index for index, is_finished in enumerate(finished) if not is_finished]
             if not active_indices:
@@ -294,8 +309,12 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 token_tensor = torch.tensor([token], dtype=torch.long, device=self.device)
                 generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
                 current_ids[episode_index] = torch.cat((current_ids[episode_index], token_tensor), dim=0)
+                self._runtime_stats["decode_tokens"] += 1.0
                 if token == getattr(self.tokenizer, "eos_token_id", None):
                     finished[episode_index] = True
+        self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0
+        self._runtime_stats["generation_padding_waste_tokens"] += float(total_padding_tokens)
+        self._runtime_stats["generation_padding_total_tokens"] += float(total_step_tokens)
 
         decoded = [self._postprocess_response(self.tokenizer.decode(tokens, skip_special_tokens=True)) for tokens in generated_ids]
         padding_ratio = float(total_padding_tokens / total_step_tokens) if total_step_tokens else 0.0
@@ -417,13 +436,11 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             return caches[0]
 
         sample_cache = caches[0]
-        if hasattr(sample_cache, "to_legacy_cache") and hasattr(type(sample_cache), "from_legacy_cache"):
-            legacy_caches = [cache.to_legacy_cache() for cache in caches]
-            stacked = self._stack_legacy_cache(legacy_caches)
-            return type(sample_cache).from_legacy_cache(stacked)
         if isinstance(sample_cache, tuple):
             return self._stack_legacy_cache(caches)
-        raise TypeError(f"Unsupported cache type for batching: {type(sample_cache)!r}")
+        legacy_caches = [self._cache_to_legacy(cache) for cache in caches]
+        stacked = self._stack_legacy_cache(legacy_caches)
+        return self._cache_from_legacy(sample_cache, stacked)
 
     def _split_past_key_values(self, cache: Any, batch_size: int) -> list[Any]:
         """Split a batched cache back into one cache object per sequence."""
@@ -433,15 +450,70 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         if batch_size == 1:
             return [cache]
 
-        if hasattr(cache, "to_legacy_cache") and hasattr(type(cache), "from_legacy_cache"):
-            legacy_cache = cache.to_legacy_cache()
-            return [
-                type(cache).from_legacy_cache(sequence_cache)
-                for sequence_cache in self._split_legacy_cache(legacy_cache)
-            ]
         if isinstance(cache, tuple):
             return self._split_legacy_cache(cache)
-        raise TypeError(f"Unsupported cache type for splitting: {type(cache)!r}")
+        legacy_cache = self._cache_to_legacy(cache)
+        return [
+            self._cache_from_legacy(cache, sequence_cache)
+            for sequence_cache in self._split_legacy_cache(legacy_cache)
+        ]
+
+    def _cache_to_legacy(
+        self,
+        cache: Any,
+    ) -> tuple[tuple[torch.Tensor, ...], ...]:
+        """Normalize supported cache objects into the legacy tuple format."""
+
+        if isinstance(cache, tuple):
+            return cache
+
+        to_legacy_cache = getattr(cache, "to_legacy_cache", None)
+        if callable(to_legacy_cache):
+            return to_legacy_cache()
+
+        layers = getattr(cache, "layers", None)
+        if layers is not None:
+            legacy_layers = []
+            for layer in layers:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                if keys is None or values is None:
+                    keys = getattr(layer, "key_cache", None)
+                    values = getattr(layer, "value_cache", None)
+                if keys is None or values is None:
+                    break
+                legacy_layers.append((keys, values))
+            else:
+                return tuple(legacy_layers)
+
+        key_cache = getattr(cache, "key_cache", None)
+        value_cache = getattr(cache, "value_cache", None)
+        if key_cache is not None and value_cache is not None:
+            return tuple(
+                (keys, values)
+                for keys, values in zip(key_cache, value_cache, strict=True)
+            )
+
+        raise TypeError(f"Unsupported cache type for conversion: {type(cache)!r}")
+
+    def _cache_from_legacy(
+        self,
+        cache_like: Any,
+        legacy_cache: tuple[tuple[torch.Tensor, ...], ...],
+    ) -> Any:
+        """Rebuild a cache object from the legacy tuple format when supported."""
+
+        if isinstance(cache_like, tuple):
+            return legacy_cache
+
+        cache_type = type(cache_like)
+        from_legacy_cache = getattr(cache_type, "from_legacy_cache", None)
+        if not callable(from_legacy_cache):
+            from_legacy_cache = getattr(cache_like, "from_legacy_cache", None)
+        if callable(from_legacy_cache):
+            return from_legacy_cache(legacy_cache)
+
+        raise TypeError(f"Unsupported cache type for reconstruction: {cache_type!r}")
 
     def _stack_legacy_cache(
         self,

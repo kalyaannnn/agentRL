@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,7 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         self.layout = layout
         self.device = device or self._infer_device()
         self.rng = rng
+        self._reset_runtime_stats()
 
         if getattr(self.tokenizer, "pad_token_id", None) is None:
             self.tokenizer.pad_token_id = getattr(self.tokenizer, "eos_token_id", 0)
@@ -58,6 +60,7 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
     def collect(self) -> RolloutBatch:
         """Run one rollout phase and return a batched multi-turn training batch."""
 
+        self._reset_runtime_stats()
         episodes: list[dict[str, Any]] = []
         for _ in range(self.config.batch_size):
             root_env = self._clone_environment(self.environment)
@@ -228,6 +231,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         if self.config.max_prompt_tokens is not None and input_ids.shape[-1] > self.config.max_prompt_tokens:
             input_ids = input_ids[:, -self.config.max_prompt_tokens :]
             attention_mask = attention_mask[:, -self.config.max_prompt_tokens :]
+        prompt_tokens = int(attention_mask.sum().item())
+        self._runtime_stats["prefill_tokens"] += float(prompt_tokens)
 
         generation_model = self.layout.model
         generation_model.config.use_cache = True
@@ -253,11 +258,14 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         }
         if self.config.do_sample and self.config.top_p < 1.0:
             generate_kwargs["top_p"] = self.config.top_p
+        start = time.perf_counter()
         with torch.no_grad():
             generated = generation_model.generate(**generate_kwargs)
+        self._runtime_stats["decode_time_ms"] += (time.perf_counter() - start) * 1000.0
 
         prompt_length = input_ids.shape[-1]
         response_ids = generated[:, prompt_length:]
+        self._runtime_stats["decode_tokens"] += float(response_ids.numel())
         response_text = self.tokenizer.decode(response_ids[0], skip_special_tokens=True)
         return self._postprocess_response(response_text)
 
@@ -269,20 +277,27 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
     ) -> torch.Tensor:
         """Generate tokens by chunk-prefilling the prompt, then decoding autoregressively."""
 
+        prompt_tokens = int(attention_mask.sum().item())
+        prefill_start = time.perf_counter()
         next_token_logits, past_key_values = self.chunked_prefill_for_generation(
             model=generation_model,
             prompt_ids=input_ids,
             chunk_size=self.config.prefill_chunk_size,
             attention_mask=attention_mask,
         )
+        self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0
         generated_tokens: list[torch.Tensor] = []
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        decode_start = time.perf_counter()
+        current_context_tokens = prompt_tokens
 
         for _ in range(self.config.max_new_tokens):
             next_token = self._sample_next_token(next_token_logits)
             generated_tokens.append(next_token)
+            self._runtime_stats["decode_tokens"] += float(next_token.numel())
             if eos_token_id is not None and bool((next_token == eos_token_id).all().item()):
                 break
+            self._runtime_stats["cache_reuse_tokens"] += float(current_context_tokens)
             outputs = generation_model(
                 input_ids=next_token.unsqueeze(-1),
                 past_key_values=past_key_values,
@@ -290,6 +305,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             )
             past_key_values = outputs.past_key_values
             next_token_logits = outputs.logits[:, -1, :]
+            current_context_tokens += 1
+        self._runtime_stats["decode_time_ms"] += (time.perf_counter() - decode_start) * 1000.0
 
         if not generated_tokens:
             return torch.empty((input_ids.shape[0], 0), dtype=torch.long, device=self.device)
@@ -368,6 +385,10 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         stacked_ids = torch.stack(padded_ids, dim=0).to(self.device)
         stacked_attention = torch.stack(padded_attention, dim=0).to(self.device)
         stacked_action = torch.stack(padded_action, dim=0).to(self.device)
+        total_token_capacity = max_length * len(tokenized)
+        total_real_tokens = sum(int(seq_ids.numel()) for seq_ids, _seq_attention, _seq_action in tokenized)
+        self._runtime_stats["sequence_padding_waste_tokens"] = float(total_token_capacity - total_real_tokens)
+        self._runtime_stats["sequence_padding_total_tokens"] = float(total_token_capacity)
         shape = (self.config.batch_size, self.config.group_size, max_length)
         return (
             stacked_ids.view(shape),
@@ -505,6 +526,18 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
                 repeated_response,
             )
 
+        generation_padding_total = float(self._runtime_stats["generation_padding_total_tokens"])
+        generation_padding_waste = float(self._runtime_stats["generation_padding_waste_tokens"])
+        sequence_padding_total = float(self._runtime_stats["sequence_padding_total_tokens"])
+        sequence_padding_waste = float(self._runtime_stats["sequence_padding_waste_tokens"])
+        total_padding_total = generation_padding_total + sequence_padding_total
+        total_padding_waste = generation_padding_waste + sequence_padding_waste
+        prefill_time_ms = float(self._runtime_stats["prefill_time_ms"])
+        decode_time_ms = float(self._runtime_stats["decode_time_ms"])
+        prefill_tokens = float(self._runtime_stats["prefill_tokens"])
+        decode_tokens = float(self._runtime_stats["decode_tokens"])
+        cache_reuse_tokens = float(self._runtime_stats["cache_reuse_tokens"])
+
         return {
             "prompts": grouped_prompts,
             "responses": grouped_responses,
@@ -512,6 +545,47 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "unique_response_ratio": unique_response_ratio,
             "reward_mean": float(rewards.mean().item()),
             "reward_std": float(rewards.std(unbiased=False).item()),
+            "prefill_time_ms": prefill_time_ms,
+            "decode_time_ms": decode_time_ms,
+            "prefill_tokens": prefill_tokens,
+            "decode_tokens": decode_tokens,
+            "prefill_tokens_per_second": (
+                prefill_tokens / (prefill_time_ms / 1000.0)
+            ) if prefill_time_ms > 0 else 0.0,
+            "decode_tokens_per_second": (
+                decode_tokens / (decode_time_ms / 1000.0)
+            ) if decode_time_ms > 0 else 0.0,
+            "cache_reuse_tokens": cache_reuse_tokens,
+            "cache_reuse_effectiveness": (
+                cache_reuse_tokens / (cache_reuse_tokens + prefill_tokens)
+            ) if (cache_reuse_tokens + prefill_tokens) > 0 else 0.0,
+            "generation_padding_waste_tokens": generation_padding_waste,
+            "generation_padding_ratio": (
+                generation_padding_waste / generation_padding_total
+            ) if generation_padding_total > 0 else 0.0,
+            "sequence_padding_waste_tokens": sequence_padding_waste,
+            "sequence_padding_ratio": (
+                sequence_padding_waste / sequence_padding_total
+            ) if sequence_padding_total > 0 else 0.0,
+            "padding_waste_tokens": total_padding_waste,
+            "padding_ratio": (
+                total_padding_waste / total_padding_total
+            ) if total_padding_total > 0 else 0.0,
+        }
+
+    def _reset_runtime_stats(self) -> None:
+        """Reset generation-side runtime counters for one rollout collection."""
+
+        self._runtime_stats = {
+            "prefill_time_ms": 0.0,
+            "decode_time_ms": 0.0,
+            "prefill_tokens": 0.0,
+            "decode_tokens": 0.0,
+            "cache_reuse_tokens": 0.0,
+            "generation_padding_waste_tokens": 0.0,
+            "generation_padding_total_tokens": 0.0,
+            "sequence_padding_waste_tokens": 0.0,
+            "sequence_padding_total_tokens": 0.0,
         }
 
     def _infer_device(self) -> torch.device:

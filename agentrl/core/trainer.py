@@ -128,6 +128,37 @@ class GRPOTrainer:
                 system_metrics["effective_batch_tokens"] = effective_batch_tokens
                 system_metrics["tokens_per_second"] = effective_batch_tokens / (total_ms / 1000.0)
                 system_metrics["padding_ratio"] = float(batch.metadata.get("padding_ratio", 0.0))
+                system_metrics["padding_waste_tokens"] = float(batch.metadata.get("padding_waste_tokens", 0.0))
+                system_metrics["generation_padding_ratio"] = float(
+                    batch.metadata.get("generation_padding_ratio", 0.0)
+                )
+                system_metrics["generation_padding_waste_tokens"] = float(
+                    batch.metadata.get("generation_padding_waste_tokens", 0.0)
+                )
+                system_metrics["sequence_padding_ratio"] = float(
+                    batch.metadata.get("sequence_padding_ratio", 0.0)
+                )
+                system_metrics["sequence_padding_waste_tokens"] = float(
+                    batch.metadata.get("sequence_padding_waste_tokens", 0.0)
+                )
+                system_metrics["prefill_time_ms"] = float(batch.metadata.get("prefill_time_ms", 0.0))
+                system_metrics["decode_time_ms"] = float(batch.metadata.get("decode_time_ms", 0.0))
+                system_metrics["prefill_tokens"] = float(batch.metadata.get("prefill_tokens", 0.0))
+                system_metrics["decode_tokens"] = float(batch.metadata.get("decode_tokens", 0.0))
+                system_metrics["prefill_tokens_per_second"] = float(
+                    batch.metadata.get("prefill_tokens_per_second", 0.0)
+                )
+                system_metrics["decode_tokens_per_second"] = float(
+                    batch.metadata.get("decode_tokens_per_second", 0.0)
+                )
+                system_metrics["cache_reuse_tokens"] = float(batch.metadata.get("cache_reuse_tokens", 0.0))
+                system_metrics["cache_reuse_effectiveness"] = float(
+                    batch.metadata.get("cache_reuse_effectiveness", 0.0)
+                )
+                system_metrics["rollout_peak_vram_mb"] = float(system_metrics.get("generation_peak_vram_mb", 0.0))
+                system_metrics["rollout_runtime_headroom_mb"] = float(
+                    system_metrics.get("generation_runtime_headroom_mb", 0.0)
+                )
                 merged_metrics = {**metrics, **system_metrics}
                 self.metrics_logger.log(step, merged_metrics)
                 if self.debugger is not None:

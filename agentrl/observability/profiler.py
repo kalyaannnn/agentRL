@@ -15,6 +15,7 @@ class _PhaseStats:
     name: str
     time_ms: float
     peak_vram_mb: float
+    runtime_headroom_mb: float
 
 
 class SystemsProfiler:
@@ -52,6 +53,7 @@ class SystemsProfiler:
                     name=name,
                     time_ms=elapsed_ms,
                     peak_vram_mb=max(peak_vram_mb, base_peak_mb),
+                    runtime_headroom_mb=self._runtime_headroom_mb(max(peak_vram_mb, base_peak_mb)),
                 )
             )
 
@@ -62,6 +64,8 @@ class SystemsProfiler:
         metrics: dict[str, float] = {}
         for phase in self._phases:
             metrics[f"{phase.name}_time_ms"] = phase.time_ms
+            metrics[f"{phase.name}_peak_vram_mb"] = phase.peak_vram_mb
+            metrics[f"{phase.name}_runtime_headroom_mb"] = phase.runtime_headroom_mb
         metrics["peak_vram_mb"] = max((phase.peak_vram_mb for phase in self._phases), default=0.0)
         metrics["total_step_time_ms"] = total_ms
         generation_ms = metrics.get("generation_time_ms", 0.0)
@@ -90,3 +94,9 @@ class SystemsProfiler:
         if not torch.cuda.is_available():
             return 0.0
         return torch.cuda.max_memory_allocated() / (1024 * 1024)
+
+    def _runtime_headroom_mb(self, peak_vram_mb: float) -> float:
+        if not torch.cuda.is_available():
+            return 0.0
+        total_mb = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 * 1024)
+        return max(total_mb - peak_vram_mb, 0.0)
