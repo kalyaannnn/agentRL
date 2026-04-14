@@ -202,6 +202,15 @@ class DynamicCacheLayout:
         return torch.zeros((batch, seq, 256), dtype=torch.float32)
 
 
+class ConstructorCache:
+    def __init__(self, ddp_cache_data=None, config=None) -> None:
+        self._legacy = tuple(ddp_cache_data or ())
+        self.config = config
+
+    def to_legacy_cache(self):
+        return self._legacy
+
+
 def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -292,6 +301,34 @@ def test_continuous_batching_stacks_and_splits_dynamic_cache() -> None:
     split = orchestrator._split_past_key_values(stacked, 2)
     assert len(split) == 2
     assert all(isinstance(item, DynamicCache) for item in split)
+    assert torch.equal(split[0].to_legacy_cache()[0][0], first.to_legacy_cache()[0][0])
+    assert torch.equal(split[1].to_legacy_cache()[0][0], second.to_legacy_cache()[0][0])
+
+
+def test_continuous_batching_reconstructs_constructor_based_cache() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        device=torch.device("cpu"),
+    )
+    first = ConstructorCache(ddp_cache_data=((torch.zeros((1, 1, 3, 1)), torch.zeros((1, 1, 3, 1))),))
+    second = ConstructorCache(ddp_cache_data=((torch.ones((1, 1, 3, 1)), torch.ones((1, 1, 3, 1))),))
+
+    stacked = orchestrator._stack_past_key_values([first, second])
+    split = orchestrator._split_past_key_values(stacked, batch_size=2)
+
+    assert isinstance(stacked, ConstructorCache)
+    assert tuple(stacked.to_legacy_cache()[0][0].shape) == (2, 1, 3, 1)
+    assert all(isinstance(item, ConstructorCache) for item in split)
     assert torch.equal(split[0].to_legacy_cache()[0][0], first.to_legacy_cache()[0][0])
     assert torch.equal(split[1].to_legacy_cache()[0][0], second.to_legacy_cache()[0][0])
 

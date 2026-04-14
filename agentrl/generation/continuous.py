@@ -511,7 +511,24 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         if not callable(from_legacy_cache):
             from_legacy_cache = getattr(cache_like, "from_legacy_cache", None)
         if callable(from_legacy_cache):
-            return from_legacy_cache(legacy_cache)
+            try:
+                return from_legacy_cache(legacy_cache)
+            except TypeError:
+                pass
+
+        # Newer cache implementations can often be reconstructed directly from
+        # legacy `(key, value)` tuples via their constructor.
+        try:
+            return cache_type(ddp_cache_data=legacy_cache)
+        except TypeError:
+            pass
+
+        config = getattr(self.layout.model, "config", None)
+        if config is not None:
+            try:
+                return cache_type(ddp_cache_data=legacy_cache, config=config)
+            except TypeError:
+                pass
 
         raise TypeError(f"Unsupported cache type for reconstruction: {cache_type!r}")
 
