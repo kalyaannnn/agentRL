@@ -477,6 +477,11 @@ def test_benchmark_systems_writes_summary(monkeypatch, tmp_path) -> None:
                     "peak_vram_mb": 123.0,
                     "rollout_peak_vram_mb": 111.0,
                     "rollout_runtime_headroom_mb": 456.0,
+                    "runtime_adjustments": 1.0,
+                    "runtime_low_headroom": 0.0,
+                    "dominant_runtime_bottleneck": "padding",
+                    "runtime_recommendation": "Padding waste is high; reduce chunk_size or group together similar prompt lengths.",
+                    "last_runtime_adjustment_reason": "high_padding_chunk_size",
                 }
             ]
 
@@ -509,6 +514,96 @@ def test_benchmark_systems_writes_summary(monkeypatch, tmp_path) -> None:
     assert '"mean_step_time_ms": 100.0' in summary
     assert '"mean_generation_fraction": 0.6' in summary
     assert '"mean_cache_reuse_effectiveness": 0.7' in summary
+    assert '"dominant_runtime_bottleneck": "padding"' in summary
+    assert '"efficiency_diagnosis": "padding-limited"' in summary
+    assert '"steps_with_runtime_adjustment": 1' in summary
+    assert '"benchmark_verdict": "continuous batching was padding-limited, dominated by padding, and needed 1 runtime adjustment.' in summary
+
+
+def test_benchmark_systems_writes_comparison_verdict(monkeypatch, tmp_path) -> None:
+    call_count = {"value": 0}
+
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            del environment, verifier
+            self.config = config
+
+        def train(self):
+            call_count["value"] += 1
+            if self.config.use_continuous_batching:
+                return [
+                    {
+                        "total_step_time_ms": 80.0,
+                        "generation_time_ms": 50.0,
+                        "training_time_ms": 30.0,
+                        "tokens_per_second": 30.0,
+                        "prefill_tokens_per_second": 25.0,
+                        "decode_tokens_per_second": 18.0,
+                        "padding_ratio": 0.2,
+                        "generation_padding_ratio": 0.2,
+                        "sequence_padding_ratio": 0.1,
+                        "cache_reuse_effectiveness": 0.8,
+                        "peak_vram_mb": 120.0,
+                        "rollout_peak_vram_mb": 110.0,
+                        "rollout_runtime_headroom_mb": 500.0,
+                        "runtime_adjustments": 1.0,
+                        "runtime_low_headroom": 0.0,
+                        "dominant_runtime_bottleneck": "padding",
+                        "runtime_recommendation": "Padding waste is high; reduce chunk_size or group together similar prompt lengths.",
+                        "last_runtime_adjustment_reason": "high_padding_chunk_size",
+                    }
+                ]
+            return [
+                {
+                    "total_step_time_ms": 100.0,
+                    "generation_time_ms": 60.0,
+                    "training_time_ms": 40.0,
+                    "tokens_per_second": 20.0,
+                    "prefill_tokens_per_second": 20.0,
+                    "decode_tokens_per_second": 12.0,
+                    "padding_ratio": 0.1,
+                    "generation_padding_ratio": 0.1,
+                    "sequence_padding_ratio": 0.05,
+                    "cache_reuse_effectiveness": 0.4,
+                    "peak_vram_mb": 118.0,
+                    "rollout_peak_vram_mb": 108.0,
+                    "rollout_runtime_headroom_mb": 520.0,
+                    "runtime_adjustments": 0.0,
+                    "runtime_low_headroom": 0.0,
+                    "dominant_runtime_bottleneck": "balanced",
+                    "runtime_recommendation": "Runtime phases look balanced for the current workload.",
+                    "last_runtime_adjustment_reason": "none",
+                }
+            ]
+
+    monkeypatch.setattr(benchmark_systems, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_systems.py",
+            "--model",
+            "fake/model",
+            "--steps",
+            "2",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "4",
+            "--max-new-tokens",
+            "16",
+            "--split",
+            "easy",
+            "--output-dir",
+            str(tmp_path / "systems_compare"),
+            "--compare-standard-vs-continuous",
+        ],
+    )
+
+    benchmark_systems_main()
+
+    comparison = (tmp_path / "systems_compare" / "comparison.json").read_text(encoding="utf-8")
+    assert '"comparison_verdict": "continuous batching was faster on mean step time than standard rollout (80.00 ms vs 100.00 ms) but was padding-limited. It needed 1 runtime adjustment."' in comparison
 
 
 def test_eval_gsm8k_subset_writes_summary(monkeypatch, tmp_path) -> None:

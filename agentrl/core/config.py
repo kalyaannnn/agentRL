@@ -48,6 +48,11 @@ class GRPOConfig:
     speculative_k: int = 4
     prefill_chunk_size: int = 512
     chunk_size: int | None = None
+    auto_tune_chunk_size: bool = True
+    execution_policy: str = "balanced"
+    min_runtime_headroom_mb: float = 1024.0
+    auto_reduce_on_oom: bool = True
+    oom_retry_budget: int = 1
     max_prompt_tokens: int | None = None
     max_episode_steps: int = 8
     temperature: float = 1.0
@@ -141,6 +146,14 @@ class GRPOConfig:
             raise ConfigurationError("debug_temperature must be 0.0 for deterministic replay.")
         if self.max_prompt_tokens is not None and self.max_prompt_tokens <= 0:
             raise ConfigurationError("max_prompt_tokens must be > 0 when provided.")
+        if self.execution_policy not in {"safe", "balanced", "max_throughput"}:
+            raise ConfigurationError(
+                "execution_policy must be one of: safe, balanced, max_throughput."
+            )
+        if self.min_runtime_headroom_mb < 0:
+            raise ConfigurationError("min_runtime_headroom_mb must be >= 0.")
+        if self.oom_retry_budget < 0:
+            raise ConfigurationError("oom_retry_budget must be >= 0.")
         if self.init_adapter_path is not None and not self.init_adapter_path.strip():
             raise ConfigurationError("init_adapter_path must be a non-empty string when provided.")
         if self.chunk_size is not None and self.chunk_size <= 0:

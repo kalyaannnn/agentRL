@@ -286,6 +286,55 @@ def test_trainer_creates_profile_trace(tmp_path) -> None:
     assert trace_path.stat().st_size > 0
 
 
+def test_trainer_retries_after_rollout_oom() -> None:
+    class OOMThenSuccessRollout:
+        def __init__(self, config: GRPOConfig, batch: RolloutBatch) -> None:
+            self.config = config
+            self.batch = batch
+            self.calls = 0
+
+        def collect(self) -> RolloutBatch:
+            self.calls += 1
+            if self.calls == 1 and (self.config.chunk_size or 0) > 1:
+                raise RuntimeError("CUDA out of memory while collecting rollout")
+            return self.batch
+
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=4,
+        chunk_size=4,
+        steps=1,
+        use_continuous_batching=True,
+        oom_retry_budget=1,
+    )
+    batch = RolloutBatch(
+        input_ids=torch.tensor([[[0, 1, 1], [0, 1, 2], [0, 1, 1], [0, 1, 2]]], dtype=torch.long),
+        attention_mask=torch.tensor([[[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]], dtype=torch.long),
+        action_mask=torch.tensor([[[0, 1, 1], [0, 1, 1], [0, 1, 1], [0, 1, 1]]], dtype=torch.bool),
+        policy_logprobs=torch.zeros((1, 4, 3), dtype=torch.float32),
+        ref_logprobs=torch.zeros((1, 4, 3), dtype=torch.float32),
+        rewards=torch.tensor([[1.0, 0.0, 1.0, 0.0]], dtype=torch.float32),
+        advantages=torch.tensor([[1.0, -1.0, 1.0, -1.0]], dtype=torch.float32),
+        metadata={"unique_response_ratio": 1.0, "responses": [["x", "y", "x", "y"]]},
+    )
+    rollout = OOMThenSuccessRollout(config=config, batch=batch)
+    trainer = GRPOTrainer(
+        config=config,
+        environment=MinimalEnvironment(),
+        verifier=MinimalVerifier(),
+        tokenizer=DummyTokenizer(),
+        layout=TrainableLayout(),
+        rollout_orchestrator=rollout,
+        metrics_logger=ClosingLogger(),
+    )
+
+    trainer.train()
+
+    assert rollout.calls == 2
+    assert config.chunk_size == 2
+
+
 def test_trainer_logs_scheduler_and_adaptive_beta(tmp_path) -> None:
     config = GRPOConfig(
         model_name="fake/model",

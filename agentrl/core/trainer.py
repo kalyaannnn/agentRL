@@ -23,6 +23,7 @@ from agentrl.memory.layout import SharedWeightLayout
 from agentrl.observability.debugger import AgentRLDebugger
 from agentrl.observability.logger import MetricsLogger
 from agentrl.observability.profiler import SystemsProfiler
+from agentrl.runtime.controller import ExecutionController
 
 
 LOGGER = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class GRPOTrainer:
         self.rng = self._build_torch_generator()
         self._maybe_compile_model()
         self._maybe_autoconfigure_chunk_size()
+        self.runtime_controller = ExecutionController(config=self.config, device=self.device)
 
         if self.config.use_gradient_checkpointing:
             gradient_checkpointing_enable = getattr(self.layout.model, "gradient_checkpointing_enable", None)
@@ -178,6 +180,7 @@ class GRPOTrainer:
                 system_metrics["rollout_runtime_headroom_mb"] = float(
                     system_metrics.get("generation_runtime_headroom_mb", 0.0)
                 )
+                system_metrics.update(self.runtime_controller.observe(system_metrics))
                 merged_metrics = {**metrics, **system_metrics}
                 self.metrics_logger.log(step, merged_metrics)
                 if self.debugger is not None:
@@ -349,10 +352,7 @@ class GRPOTrainer:
         self._last_profiled_batch = None
         self._last_profiled_metrics = None
         if self.config.profile_steps is None or step >= self.config.profile_steps:
-            with profiler.phase("generation"):
-                batch = self.rollout.collect()
-            with profiler.phase("training"):
-                _, metrics = self.step(batch, perform_optimizer_step=should_step)
+            batch, metrics = self._execute_step_with_recovery(profiler, should_step)
             self._last_profiled_batch = batch
             self._last_profiled_metrics = metrics
             return
@@ -361,10 +361,7 @@ class GRPOTrainer:
             from torch.profiler import ProfilerActivity, profile
         except ImportError:
             LOGGER.warning("torch.profiler is unavailable; skipping profile export for step %s", step)
-            with profiler.phase("generation"):
-                batch = self.rollout.collect()
-            with profiler.phase("training"):
-                _, metrics = self.step(batch, perform_optimizer_step=should_step)
+            batch, metrics = self._execute_step_with_recovery(profiler, should_step)
             self._last_profiled_batch = batch
             self._last_profiled_metrics = metrics
             return
@@ -380,14 +377,53 @@ class GRPOTrainer:
             record_shapes=True,
             with_stack=True,
         ) as torch_profiler:
-            with profiler.phase("generation"):
-                batch = self.rollout.collect()
-            with profiler.phase("training"):
-                _, metrics = self.step(batch, perform_optimizer_step=should_step)
+            batch, metrics = self._execute_step_with_recovery(profiler, should_step)
         torch_profiler.export_chrome_trace(str(trace_path))
         metrics["profile_trace_path"] = str(trace_path)
         self._last_profiled_batch = batch
         self._last_profiled_metrics = metrics
+
+    def _execute_step_with_recovery(
+        self,
+        profiler: SystemsProfiler,
+        should_step: bool,
+    ) -> tuple[RolloutBatch, dict[str, float]]:
+        """Collect and train once, retrying with safer settings after OOM."""
+
+        while True:
+            try:
+                with profiler.phase("generation"):
+                    batch = self.rollout.collect()
+            except RuntimeError as exc:
+                if not self._is_cuda_oom(exc):
+                    raise
+                if not self.runtime_controller.handle_oom(stage="generation"):
+                    raise
+                self._clear_runtime_oom_state()
+                continue
+
+            try:
+                with profiler.phase("training"):
+                    _, metrics = self.step(batch, perform_optimizer_step=should_step)
+                return batch, metrics
+            except RuntimeError as exc:
+                if not self._is_cuda_oom(exc):
+                    raise
+                if not self.runtime_controller.handle_oom(stage="training"):
+                    raise
+                self._clear_runtime_oom_state()
+
+    def _is_cuda_oom(self, exc: RuntimeError) -> bool:
+        """Return True when the exception looks like a device OOM."""
+
+        return "out of memory" in str(exc).lower()
+
+    def _clear_runtime_oom_state(self) -> None:
+        """Clear accumulated gradients and CUDA caches before retrying."""
+
+        self.optimizer.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _log_degenerate_batch_warnings(
         self,
@@ -530,6 +566,8 @@ class GRPOTrainer:
 
         if self.config.chunk_size is not None:
             return
+        if not self.config.auto_tune_chunk_size:
+            return
         if not self.config.use_continuous_batching:
             return
         if self.device.type != "cuda":
@@ -586,6 +624,8 @@ class GRPOTrainer:
                     "runtime_headroom_mb": None,
                 }
             )
+            model_config = getattr(self.layout.model, "config", None)
+            report.update(self.runtime_controller.build_preflight_report(report, model_config))
             return report
 
         free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
@@ -598,6 +638,8 @@ class GRPOTrainer:
                 "runtime_headroom_mb": free_bytes / (1024 * 1024),
             }
         )
+        model_config = getattr(self.layout.model, "config", None)
+        report.update(self.runtime_controller.build_preflight_report(report, model_config))
         return report
 
     def _log_startup_report(self) -> None:
@@ -605,12 +647,16 @@ class GRPOTrainer:
 
         report = self.startup_report
         LOGGER.info(
-            "startup device=%s | parameter_total_mb=%s | free_mb=%s | reserved_mb=%s | allocated_mb=%s",
+            "startup device=%s | parameter_total_mb=%s | free_mb=%s | reserved_mb=%s | allocated_mb=%s | "
+            "chunk_size=%s | preflight_risk=%s | recommendation=%s",
             report.get("device_name"),
             self._format_optional_metric(report.get("parameter_total_mb")),
             self._format_optional_metric(report.get("device_free_mb")),
             self._format_optional_metric(report.get("device_reserved_mb")),
             self._format_optional_metric(report.get("device_allocated_mb")),
+            self._format_optional_metric(report.get("current_chunk_size")),
+            self._format_optional_metric(report.get("preflight_risk")),
+            self._format_optional_metric(report.get("execution_recommendation")),
         )
 
     def _format_optional_metric(self, value: float | str | None) -> str:
