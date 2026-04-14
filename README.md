@@ -1,5 +1,5 @@
 
-› # AgentRL
+  AgentRL
 
   AgentRL is a lightweight single-GPU framework for verifier-based GRPO style
   post-training of language models.
