@@ -160,3 +160,44 @@ def test_trainer_selects_speculative_orchestrator_from_config() -> None:
     )
 
     assert isinstance(trainer.rollout, SpeculativeRolloutOrchestrator)
+
+
+def test_speculative_verify_draft_samples_on_prefix_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+        do_sample=False,
+        use_speculative_decoding=True,
+        draft_model_name="fake/draft",
+    )
+    orchestrator = SpeculativeRolloutOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=Layout(),
+        draft_model=PredictiveModel(strong=False),
+        device=torch.device("cpu"),
+    )
+
+    seen: dict[str, object] = {}
+    original_rand = torch.rand
+
+    def recording_rand(*args, **kwargs):
+        seen["device"] = kwargs.get("device")
+        return original_rand(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "rand", recording_rand)
+
+    prefix_ids = torch.tensor([[ord("t"), ord("a")]], dtype=torch.long, device=orchestrator.device)
+    accepted = orchestrator._verify_draft(
+        prefix_ids=prefix_ids,
+        draft_tokens=[ord("a")],
+        draft_logprobs=[0.0],
+        draft_probs=[torch.full((256,), 1 / 256, dtype=torch.float32, device=orchestrator.device)],
+    )
+
+    assert accepted
+    assert seen["device"] == prefix_ids.device

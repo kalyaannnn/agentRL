@@ -256,7 +256,7 @@ class SpeculativeRolloutOrchestrator(RolloutOrchestrator):
             policy_position = prefix_length - 1 + index
             policy_logprob = float(logprobs[0, policy_position, token_id].item())
             acceptance = min(1.0, float(torch.exp(torch.tensor(policy_logprob - draft_logprob)).item()))
-            if torch.rand(1, generator=self.rng).item() <= acceptance:
+            if torch.rand(1, generator=self.rng, device=prefix_ids.device).item() <= acceptance:
                 accepted_steps.append(_SpeculativeStep(token_id=token_id, policy_logprob=policy_logprob))
                 if token_id == getattr(self.tokenizer, "eos_token_id", None):
                     return accepted_steps
