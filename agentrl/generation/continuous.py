@@ -388,10 +388,16 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             prompt_masks = [sequence.prompt_mask for sequence in batch]
             batch_caches, batch_logits = self._prefill_prompt_caches(generation_model, prompt_ids, prompt_masks)
             for offset, sequence in enumerate(batch):
+                cache = batch_caches[offset]
                 paged_kv.write_sequence_cache(
                     sequence.original_index,
-                    self._cache_to_legacy(batch_caches[offset]),
-                    batch_caches[offset],
+                    self._cache_to_legacy(cache),
+                    cache,
+                )
+                paged_kv.set_resident_cache(
+                    sequence_id=sequence.original_index,
+                    cache=cache,
+                    cache_template=cache,
                 )
                 next_logits_by_index[sequence.original_index] = batch_logits[offset : offset + 1]
         self._runtime_stats["prefill_time_ms"] += (time.perf_counter() - prefill_start) * 1000.0

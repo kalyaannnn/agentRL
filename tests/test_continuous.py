@@ -7,7 +7,7 @@ import pytest
 
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 from agentrl.core.config import GRPOConfig
-from agentrl.generation.continuous import ContinuousBatchingOrchestrator
+from agentrl.generation.continuous import ContinuousBatchingOrchestrator, _ScheduledSequence
 
 try:
     from transformers.cache_utils import DynamicCache
@@ -340,6 +340,57 @@ def test_paged_kv_continuous_collects_block_metrics() -> None:
     assert batch.metadata["paged_kv_block_size_tokens"] == 16.0
     assert batch.metadata["paged_kv_free_block_count"] >= 0.0
     assert batch.metadata["paged_kv_max_blocks_in_use"] >= 1.0
+
+
+def test_paged_kv_prefill_seeds_resident_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=1,
+        use_paged_kv_continuous=True,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=ChunkedLayout(),
+        device=torch.device("cpu"),
+    )
+    scheduler = orchestrator._build_scheduler_state(active_count=2)
+    prompts = [torch.tensor([1, 2], dtype=torch.long), torch.tensor([1, 2], dtype=torch.long)]
+    masks = [torch.ones_like(prompt) for prompt in prompts]
+    sequences = [
+        _ScheduledSequence(original_index=index, prompt_ids=prompt, prompt_mask=mask)
+        for index, (prompt, mask) in enumerate(zip(prompts, masks, strict=True))
+    ]
+
+    resident_sequence_ids: list[int] = []
+    original_build = orchestrator._build_paged_kv_allocator
+
+    def capture_store(*args, **kwargs):
+        store = original_build(*args, **kwargs)
+        original_set_resident_cache = store.set_resident_cache
+
+        def capture_set_resident_cache(*, sequence_id: int, cache: object, cache_template: object | None = None) -> None:
+            original_set_resident_cache(
+                sequence_id=sequence_id,
+                cache=cache,
+                cache_template=cache_template,
+            )
+            resident_sequence_ids.append(sequence_id)
+            assert store.has_resident_cache(sequence_id) is True
+
+        monkeypatch.setattr(store, "set_resident_cache", capture_set_resident_cache)
+        return store
+
+    monkeypatch.setattr(orchestrator, "_build_paged_kv_allocator", capture_store)
+
+    orchestrator._generate_active_batch_with_cache(sequences, scheduler)
+
+    assert resident_sequence_ids == [0, 1]
 
 
 def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
