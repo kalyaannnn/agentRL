@@ -268,6 +268,62 @@ class ConfigRequiredConstructorCache:
         return self._legacy
 
 
+class ConfigRequiredConstructorCacheStepModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            use_cache=False,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            hidden_size=8,
+        )
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: ConfigRequiredConstructorCache | None = None,
+        use_cache: bool = True,
+    ) -> SimpleNamespace:
+        del attention_mask, use_cache
+        past_length = 0 if past_key_values is None else int(past_key_values.to_legacy_cache()[0][0].shape[2])
+
+        vocab = 256
+        logits = torch.full((input_ids.shape[0], input_ids.shape[1], vocab), -1e9, dtype=torch.float32)
+        if past_length == 0:
+            logits[:, -1, ord("a")] = 0.0
+        else:
+            next_tokens = torch.where(input_ids[:, -1] == ord("a"), ord("b"), 3)
+            logits[torch.arange(input_ids.shape[0]), -1, next_tokens] = 0.0
+
+        new_length = past_length + input_ids.shape[-1]
+        key = torch.zeros((input_ids.shape[0], 1, new_length, 1), dtype=torch.float32)
+        value = torch.zeros((input_ids.shape[0], 1, new_length, 1), dtype=torch.float32)
+        return SimpleNamespace(
+            logits=logits,
+            past_key_values=ConfigRequiredConstructorCache(
+                ddp_cache_data=((key, value),),
+                config=self.config,
+            ),
+        )
+
+
+class ConfigRequiredConstructorCacheLayout:
+    def __init__(self) -> None:
+        self.model = ConfigRequiredConstructorCacheStepModel()
+
+    def policy_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+
 def test_continuous_batching_collects_and_reports_padding_ratio() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -833,6 +889,74 @@ def test_paged_kv_continuous_decode_keeps_legacy_materialization_available(
     legacy_cache = store.read_sequence_legacy_cache(0)
 
     assert responses == ["ab", "ab"]
+    assert store.has_resident_cache(0) is False
+    assert tuple(legacy_cache[0][0].shape) == (1, 1, 4, 1)
+    assert torch.equal(legacy_cache[0][0], resident_cache[0][0])
+    assert torch.equal(legacy_cache[0][1], resident_cache[0][1])
+
+
+def test_paged_kv_continuous_constructor_cache_keeps_legacy_materialization_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=2,
+        use_paged_kv_continuous=True,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=ConfigRequiredConstructorCacheLayout(),
+        device=torch.device("cpu"),
+    )
+    scheduler = orchestrator._build_scheduler_state(active_count=2)
+    prompts = [torch.tensor([1, 2], dtype=torch.long), torch.tensor([1, 2], dtype=torch.long)]
+    masks = [torch.ones_like(prompt) for prompt in prompts]
+    sequences = [
+        _ScheduledSequence(original_index=index, prompt_ids=prompt, prompt_mask=mask)
+        for index, (prompt, mask) in enumerate(zip(prompts, masks, strict=True))
+    ]
+
+    captured_store: list[PagedKVCacheStore] = []
+    original_build = orchestrator._build_paged_kv_allocator
+    original_to_legacy = orchestrator._cache_to_legacy
+    conversion_counts = {"to_legacy": 0, "from_legacy": 0}
+
+    def capture_store(*args, **kwargs):
+        store = original_build(*args, **kwargs)
+        monkeypatch.setattr(store, "release", lambda sequence_id: None)
+        captured_store.append(store)
+        return store
+
+    def guarded_cache_to_legacy(cache):
+        conversion_counts["to_legacy"] += 1
+        if conversion_counts["to_legacy"] > 2:
+            raise AssertionError("decode path should not convert constructor cache to legacy tuples")
+        return original_to_legacy(cache)
+
+    def guarded_cache_from_legacy(*args, **kwargs):
+        del args, kwargs
+        conversion_counts["from_legacy"] += 1
+        raise AssertionError("decode path should not rebuild constructor cache from legacy tuples")
+
+    monkeypatch.setattr(orchestrator, "_build_paged_kv_allocator", capture_store)
+    monkeypatch.setattr(orchestrator, "_cache_to_legacy", guarded_cache_to_legacy)
+    monkeypatch.setattr(orchestrator, "_cache_from_legacy", guarded_cache_from_legacy)
+
+    responses, _padding_ratio = orchestrator._generate_active_batch_with_cache(sequences, scheduler)
+
+    store = captured_store[0]
+    resident_cache = store.resident_cache(0).to_legacy_cache()
+    store.clear_resident_cache(0)
+    legacy_cache = store.read_sequence_legacy_cache(0)
+
+    assert responses == ["ab", "ab"]
+    assert conversion_counts == {"to_legacy": 2, "from_legacy": 0}
     assert store.has_resident_cache(0) is False
     assert tuple(legacy_cache[0][0].shape) == (1, 1, 4, 1)
     assert torch.equal(legacy_cache[0][0], resident_cache[0][0])
