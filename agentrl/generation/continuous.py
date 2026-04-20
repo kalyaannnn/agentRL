@@ -440,7 +440,6 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 generated_ids[episode_index] = torch.cat((generated_ids[episode_index], token_tensor), dim=0)
                 self._runtime_stats["decode_tokens"] += float(token_tensor.numel())
                 generated_steps[episode_index] += 1
-                paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
                 token = int(token_tensor.item())
                 if eos_token_id is not None and token == eos_token_id:
                     finished[episode_index] = True
@@ -481,6 +480,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                     use_cache=True,
                 )
                 bucket_logits = outputs.logits[:, -1, :]
+                for episode_index, token_tensor in bucket:
+                    paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
                 paged_kv.write_batched_legacy_cache(
                     bucket_indices,
                     self._cache_to_legacy(outputs.past_key_values),
