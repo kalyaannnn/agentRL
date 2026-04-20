@@ -275,21 +275,23 @@ class PagedKVCacheStore:
     def read_sequence_legacy_cache(self, sequence_id: int) -> tuple[tuple[torch.Tensor, ...], ...]:
         view = self.allocator.view(sequence_id)
         token_count = view.token_count
-        layers: list[tuple[torch.Tensor, ...]] = []
+        resident_cache = self._resident_caches.get(sequence_id)
+        if resident_cache is not None:
+            legacy_cache = self._as_legacy_cache(resident_cache, sequence_id)
+            return tuple(
+                tuple(tensor[:, :, :token_count, ...].clone() for tensor in layer_cache)
+                for layer_cache in legacy_cache
+            )
 
         keys = [key for key in self._storage if key[0] in view.physical_blocks]
         if not keys:
-            template = self._cache_templates[sequence_id]
-            legacy_template = template if isinstance(template, tuple) else None
-            if legacy_template is None and hasattr(template, "to_legacy_cache"):
-                legacy_template = template.to_legacy_cache()
-            if legacy_template is None:
-                raise TypeError(f"Unsupported cache template for sequence {sequence_id}: {type(template)!r}")
+            legacy_template = self._as_legacy_cache(self._cache_templates[sequence_id], sequence_id)
             return tuple(
                 tuple(tensor[:, :, :token_count, ...].clone() for tensor in layer_template)
                 for layer_template in legacy_template
             )
 
+        layers: list[tuple[torch.Tensor, ...]] = []
         layer_indices = sorted({layer_index for _block_id, layer_index, _state_index in keys})
         for layer_index in layer_indices:
             state_indices = sorted(
@@ -309,6 +311,14 @@ class PagedKVCacheStore:
                 states.append(reconstructed)
             layers.append(tuple(states))
         return tuple(layers)
+
+    @staticmethod
+    def _as_legacy_cache(cache: Any, sequence_id: int) -> tuple[tuple[torch.Tensor, ...], ...]:
+        if isinstance(cache, tuple):
+            return cache
+        if hasattr(cache, "to_legacy_cache"):
+            return cache.to_legacy_cache()
+        raise TypeError(f"Unsupported cache template for sequence {sequence_id}: {type(cache)!r}")
 
     def read_batched_legacy_cache(self, sequence_ids: list[int]) -> tuple[tuple[torch.Tensor, ...], ...]:
         sequence_caches = [self.read_sequence_legacy_cache(sequence_id) for sequence_id in sequence_ids]

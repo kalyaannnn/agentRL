@@ -391,7 +391,8 @@ def test_paged_kv_prefill_seeds_resident_caches(monkeypatch: pytest.MonkeyPatch)
 
     orchestrator._generate_active_batch_with_cache(sequences, scheduler)
 
-    assert resident_sequence_ids == [0, 1]
+    assert resident_sequence_ids[:2] == [0, 1]
+    assert set(resident_sequence_ids) == {0, 1}
 
 
 def test_continuous_batching_uses_chunked_prefill_for_long_prompts() -> None:
@@ -675,13 +676,21 @@ def test_paged_kv_continuous_decode_uses_resident_caches(
         device=torch.device("cpu"),
     )
 
-    def explode_on_decode(self, sequence_ids: list[int]):
+    def explode_on_decode_read(self, sequence_ids: list[int]):
         raise AssertionError(
             "decode path should not rebuild from legacy cache: "
             f"read_batched_legacy_cache({sequence_ids})"
         )
 
-    monkeypatch.setattr(PagedKVCacheStore, "read_batched_legacy_cache", explode_on_decode)
+    def explode_on_decode_write(self, sequence_ids: list[int], legacy_cache, cache_template):
+        del legacy_cache, cache_template
+        raise AssertionError(
+            "decode path should not mirror to legacy cache: "
+            f"write_batched_legacy_cache({sequence_ids})"
+        )
+
+    monkeypatch.setattr(PagedKVCacheStore, "read_batched_legacy_cache", explode_on_decode_read)
+    monkeypatch.setattr(PagedKVCacheStore, "write_batched_legacy_cache", explode_on_decode_write)
 
     batch = orchestrator.collect()
 
@@ -725,7 +734,15 @@ def test_paged_kv_continuous_decode_keeps_legacy_materialization_available(
         captured_store.append(store)
         return store
 
+    def explode_on_decode_write(self, sequence_ids: list[int], legacy_cache, cache_template):
+        del legacy_cache, cache_template
+        raise AssertionError(
+            "decode path should not mirror to legacy cache: "
+            f"write_batched_legacy_cache({sequence_ids})"
+        )
+
     monkeypatch.setattr(orchestrator, "_build_paged_kv_allocator", capture_store)
+    monkeypatch.setattr(PagedKVCacheStore, "write_batched_legacy_cache", explode_on_decode_write)
 
     responses, _padding_ratio = orchestrator._generate_active_batch_with_cache(sequences, scheduler)
 

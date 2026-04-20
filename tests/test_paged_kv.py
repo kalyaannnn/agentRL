@@ -91,6 +91,36 @@ def test_paged_kv_cache_store_roundtrips_legacy_cache() -> None:
     assert torch.equal(restored[0][1], legacy[0][1])
 
 
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_paged_kv_cache_store_materializes_from_resident_cache_when_storage_is_stale() -> None:
+    allocator = PagedKVAllocator(total_blocks=8, block_size_tokens=2)
+    store = PagedKVCacheStore(allocator=allocator)
+    store.reserve(sequence_id=1, token_count=3)
+
+    initial_legacy = ((
+        torch.arange(3, dtype=torch.float32).view(1, 1, 3, 1),
+        torch.arange(10, 13, dtype=torch.float32).view(1, 1, 3, 1),
+    ),)
+    store.write_sequence_cache(sequence_id=1, legacy_cache=initial_legacy, cache_template=initial_legacy)
+
+    store.append_tokens(sequence_id=1, token_count=1)
+    resident_legacy = ((
+        torch.arange(4, dtype=torch.float32).view(1, 1, 4, 1),
+        torch.arange(10, 14, dtype=torch.float32).view(1, 1, 4, 1),
+    ),)
+    store.set_resident_cache(
+        sequence_id=1,
+        cache=DynamicCache.from_legacy_cache(resident_legacy),
+        cache_template=DynamicCache.from_legacy_cache(resident_legacy),
+    )
+
+    restored = store.read_sequence_legacy_cache(1)
+
+    assert tuple(restored[0][0].shape) == (1, 1, 4, 1)
+    assert torch.equal(restored[0][0], resident_legacy[0][0])
+    assert torch.equal(restored[0][1], resident_legacy[0][1])
+
+
 def test_paged_kv_cache_store_tracks_resident_tuple_cache() -> None:
     allocator = PagedKVAllocator(total_blocks=4, block_size_tokens=2)
     store = PagedKVCacheStore(allocator=allocator)
