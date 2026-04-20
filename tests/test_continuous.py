@@ -689,6 +689,57 @@ def test_paged_kv_continuous_decode_uses_resident_caches(
 
 
 @pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
+def test_paged_kv_continuous_decode_keeps_legacy_materialization_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=2,
+        use_paged_kv_continuous=True,
+        do_sample=False,
+    )
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=DynamicCacheLayout(),
+        device=torch.device("cpu"),
+    )
+    scheduler = orchestrator._build_scheduler_state(active_count=2)
+    prompts = [torch.tensor([1, 2], dtype=torch.long), torch.tensor([1, 2], dtype=torch.long)]
+    masks = [torch.ones_like(prompt) for prompt in prompts]
+    sequences = [
+        _ScheduledSequence(original_index=index, prompt_ids=prompt, prompt_mask=mask)
+        for index, (prompt, mask) in enumerate(zip(prompts, masks, strict=True))
+    ]
+
+    captured_store: list[PagedKVCacheStore] = []
+    original_build = orchestrator._build_paged_kv_allocator
+
+    def capture_store(*args, **kwargs):
+        store = original_build(*args, **kwargs)
+        monkeypatch.setattr(store, "release", lambda sequence_id: None)
+        captured_store.append(store)
+        return store
+
+    monkeypatch.setattr(orchestrator, "_build_paged_kv_allocator", capture_store)
+
+    responses, _padding_ratio = orchestrator._generate_active_batch_with_cache(sequences, scheduler)
+
+    store = captured_store[0]
+    legacy_cache = store.read_sequence_legacy_cache(0)
+    resident_cache = store.resident_cache(0).to_legacy_cache()
+
+    assert responses == ["ab", "ab"]
+    assert tuple(legacy_cache[0][0].shape) == (1, 1, 4, 1)
+    assert torch.equal(legacy_cache[0][0], resident_cache[0][0])
+    assert torch.equal(legacy_cache[0][1], resident_cache[0][1])
+
+
+@pytest.mark.skipif(DynamicCache is None, reason="transformers DynamicCache is unavailable")
 def test_paged_kv_continuous_dynamic_cache_handles_block_growth() -> None:
     config = GRPOConfig(
         model_name="fake/model",

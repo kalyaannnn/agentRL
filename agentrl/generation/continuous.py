@@ -486,6 +486,11 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 bucket_logits = outputs.logits[:, -1, :]
                 for episode_index, token_tensor in bucket:
                     paged_kv.append_tokens(episode_index, int(token_tensor.numel()))
+                paged_kv.write_batched_legacy_cache(
+                    bucket_indices,
+                    self._cache_to_legacy(outputs.past_key_values),
+                    outputs.past_key_values,
+                )
 
                 for offset, episode_index in enumerate(bucket_indices):
                     paged_kv.set_resident_cache(
