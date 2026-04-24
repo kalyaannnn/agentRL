@@ -472,7 +472,7 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         return aligned
 
     def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Normalize rewards within each prompt group and clip advantages."""
+        """Normalize rewards within each prompt group."""
 
         mean = rewards.mean(dim=1, keepdim=True)
         std = rewards.std(dim=1, keepdim=True, unbiased=False)
@@ -488,7 +488,7 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             (rewards - mean) / (std + 1e-8),
             torch.zeros_like(rewards),
         )
-        return normalized.clamp(min=-self.config.clip_range, max=self.config.clip_range)
+        return normalized
 
     def _build_metadata(self, episodes: list[dict[str, Any]], rewards: torch.Tensor) -> dict[str, Any]:
         """Build replay/debug metadata and batch-level exploration warnings."""

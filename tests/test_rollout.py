@@ -8,6 +8,7 @@ import torch
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 from agentrl.core.config import GRPOConfig
 from agentrl.core.rollout import RolloutOrchestrator
+from agentrl.generation.continuous import ContinuousBatchingOrchestrator
 
 
 class CharTokenizer:
@@ -102,6 +103,76 @@ class FakeLayout:
         return logits
 
 
+class ReferenceGuardLayout(FakeLayout):
+    def __init__(self, outputs: list[str]) -> None:
+        super().__init__(outputs)
+        self.reference_calls = 0
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del input_ids, attention_mask
+        self.reference_calls += 1
+        raise AssertionError("reference_forward should not run during rollout collection.")
+
+
+class SingleTurnEnvironment(BaseEnvironment):
+    def reset(self) -> str:
+        return "task"
+
+    def step(self, action: str) -> tuple[str, bool]:
+        del action
+        return ("done", True)
+
+    def state(self) -> dict[str, str]:
+        return {"expected": "ab"}
+
+
+class PrefixVerifier(BaseVerifier):
+    def verify(self, response: str, env_state: dict[str, str]) -> float:
+        return 1.0 if response.startswith(env_state["expected"]) else 0.0
+
+
+class ContinuousStepModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            use_cache=False,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            hidden_size=8,
+        )
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def generate_step(self, active_sequences: list[torch.Tensor], active_indices: list[int]) -> list[int]:
+        del active_indices
+        outputs: list[int] = []
+        for sequence in active_sequences:
+            text = "".join(chr(int(value)) for value in sequence.tolist() if value != 0)
+            generated = text.split("Assistant:\n")[-1]
+            if generated == "":
+                outputs.append(ord("a"))
+            elif generated == "a":
+                outputs.append(ord("b"))
+            else:
+                outputs.append(3)
+        return outputs
+
+
+class ContinuousPolicyOnlyLayout:
+    def __init__(self) -> None:
+        self.model = ContinuousStepModel()
+        self.reference_calls = 0
+
+    def policy_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del attention_mask
+        batch, seq = input_ids.shape
+        return torch.zeros((batch, seq, 256), dtype=torch.float32)
+
+    def reference_forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        del input_ids, attention_mask
+        self.reference_calls += 1
+        raise AssertionError("reference_forward should not run during continuous rollout collection.")
+
+
 class ChunkedPrefillModel(torch.nn.Module):
     def __init__(self, output: str) -> None:
         super().__init__()
@@ -180,6 +251,82 @@ def test_rollout_collects_multi_turn_grouped_batch() -> None:
     assert "padding_waste_tokens" in batch.metadata
 
 
+def test_rollout_collects_old_policy_logprobs_only() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=8,
+        max_episode_steps=3,
+    )
+    layout = ReferenceGuardLayout(outputs=["plan", "done", "plan", "bad"])
+    orchestrator = RolloutOrchestrator(
+        config=config,
+        environment=TwoTurnEnvironment(),
+        verifier=FinalAnswerVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=layout,
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.old_policy_logprobs.abs().sum().item() > 0.0
+    assert hasattr(batch, "completion_mask")
+    assert hasattr(batch, "old_policy_logprobs")
+    assert not hasattr(batch, "action_mask")
+    assert not hasattr(batch, "policy_logprobs")
+    assert not hasattr(batch, "ref_logprobs")
+    assert layout.reference_calls == 0
+
+
+def test_continuous_rollout_collects_old_policy_logprobs_only() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        batch_size=1,
+        group_size=2,
+        max_new_tokens=4,
+        do_sample=False,
+    )
+    layout = ContinuousPolicyOnlyLayout()
+    orchestrator = ContinuousBatchingOrchestrator(
+        config=config,
+        environment=SingleTurnEnvironment(),
+        verifier=PrefixVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=layout,
+        device=torch.device("cpu"),
+    )
+
+    batch = orchestrator.collect()
+
+    assert batch.completion_mask.shape == batch.input_ids.shape
+    assert batch.old_policy_logprobs.shape == batch.input_ids.shape
+    assert batch.old_policy_logprobs.abs().sum().item() > 0.0
+    assert not hasattr(batch, "action_mask")
+    assert not hasattr(batch, "policy_logprobs")
+    assert not hasattr(batch, "ref_logprobs")
+    assert layout.reference_calls == 0
+    assert all(response.startswith("ab") for response in batch.metadata["responses"][0])
+
+    for episode_index, transcript in enumerate(batch.metadata["transcripts"][0]):
+        completion_text = batch.metadata["responses"][0][episode_index]
+        expected_mask = torch.zeros_like(batch.completion_mask[0, episode_index], dtype=torch.bool)
+        start = transcript.index(completion_text)
+        end = start + len(completion_text)
+        expected_mask[start:end] = True
+
+        assert transcript == f"Observation:\ntask\n\nAssistant:\n{completion_text}\n\n"
+        assert torch.equal(batch.completion_mask[0, episode_index], expected_mask)
+        assert batch.completion_mask[0, episode_index, 0].item() is False
+        assert torch.all(
+            batch.old_policy_logprobs[0, episode_index].masked_select(~batch.completion_mask[0, episode_index]) == 0
+        )
+        assert torch.any(
+            batch.old_policy_logprobs[0, episode_index].masked_select(batch.completion_mask[0, episode_index]) != 0
+        )
+
+
 def test_rollout_completion_mask_and_old_policy_logprobs_follow_completion_tokens() -> None:
     config = GRPOConfig(
         model_name="fake/model",
@@ -212,6 +359,40 @@ def test_rollout_completion_mask_and_old_policy_logprobs_follow_completion_token
     assert batch.completion_mask[0, 0, 0].item() is False
     assert torch.all(batch.old_policy_logprobs.masked_select(~batch.completion_mask) == 0)
     assert torch.any(batch.old_policy_logprobs.masked_select(batch.completion_mask) != 0)
+
+
+def test_compute_advantages_zero_std_groups_are_zero_without_clipping() -> None:
+    config = GRPOConfig(
+        model_name="fake/model",
+        clip_range=0.25,
+    )
+    orchestrator = RolloutOrchestrator(
+        config=config,
+        environment=TwoTurnEnvironment(),
+        verifier=FinalAnswerVerifier(),
+        tokenizer=CharTokenizer(),
+        layout=FakeLayout(outputs=[]),
+        device=torch.device("cpu"),
+    )
+
+    advantages = orchestrator._compute_advantages(
+        torch.tensor(
+            [
+                [5.0, 5.0],
+                [0.0, 4.0],
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    expected = torch.tensor(
+        [
+            [0.0, 0.0],
+            [-1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(advantages, expected, atol=1e-5)
 
 
 def test_rollout_warns_when_episode_hits_turn_cap(caplog: pytest.LogCaptureFixture) -> None:

@@ -157,27 +157,21 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             for state in states
         ]
 
-        input_ids, attention_mask, action_mask = self._pack_sequences(episode_dicts)
+        input_ids, attention_mask, completion_mask = self._pack_sequences(episode_dicts)
         flat_input_ids = input_ids.view(-1, input_ids.shape[-1])
         flat_attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
-        flat_action_mask = action_mask.view(-1, action_mask.shape[-1])
+        flat_completion_mask = completion_mask.view(-1, completion_mask.shape[-1])
 
         model_config = getattr(self.layout.model, "config", None)
         if model_config is not None:
             model_config.use_cache = False
 
         with torch.no_grad():
-            policy_sequences = self._compute_logprobs(
+            old_policy_sequences = self._compute_logprobs(
                 self.layout.policy_forward,
                 flat_input_ids,
                 flat_attention_mask,
-                flat_action_mask,
-            )
-            ref_sequences = self._compute_logprobs(
-                self.layout.reference_forward,
-                flat_input_ids,
-                flat_attention_mask,
-                flat_action_mask,
+                flat_completion_mask,
             )
 
         rewards = torch.tensor(
@@ -192,9 +186,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         return RolloutBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            action_mask=action_mask,
-            policy_logprobs=policy_sequences.view_as(input_ids),
-            ref_logprobs=ref_sequences.view_as(input_ids),
+            completion_mask=completion_mask,
+            old_policy_logprobs=old_policy_sequences.view_as(input_ids),
             rewards=rewards,
             advantages=advantages,
             metadata=metadata,
