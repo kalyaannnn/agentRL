@@ -214,7 +214,7 @@ class SharedWeightLayout:
 
         if adapter_dir is not None and hasattr(model, "load_adapter"):
             model.load_adapter(
-                adapter_dir,
+                str(adapter_dir),
                 adapter_name=self.POLICY_ADAPTER_NAME,
                 is_trainable=True,
             )
@@ -231,8 +231,9 @@ class SharedWeightLayout:
             load_adapter = getattr(model, "load_adapter", None)
             if load_adapter is None:
                 raise AttributeError("PEFT model does not expose load_adapter().")
+            adapter_load_path = self._resolve_saved_adapter_path(temp_path, active_adapter)
             load_adapter(
-                temp_path,
+                str(adapter_load_path),
                 adapter_name=self.POLICY_ADAPTER_NAME,
                 is_trainable=True,
             )
@@ -250,8 +251,9 @@ class SharedWeightLayout:
             with TemporaryDirectory() as temp_dir:
                 temp_path = Path(temp_dir)
                 self._save_named_adapter(temp_path, adapter_name=self.POLICY_ADAPTER_NAME)
+                adapter_load_path = self._resolve_saved_adapter_path(temp_path, self.POLICY_ADAPTER_NAME)
                 load_adapter(
-                    temp_path,
+                    str(adapter_load_path),
                     adapter_name=self.REFERENCE_ADAPTER_NAME,
                     is_trainable=False,
                 )
@@ -314,6 +316,16 @@ class SharedWeightLayout:
         except TypeError:
             self._set_active_adapter(adapter_name, model=target)
             save_pretrained(path)
+
+    def _resolve_saved_adapter_path(self, path: Path, adapter_name: str) -> Path:
+        """Return the directory PEFT can load after saving one selected adapter."""
+
+        if (path / "adapter_config.json").exists():
+            return path
+        nested_path = path / adapter_name
+        if (nested_path / "adapter_config.json").exists() or nested_path.exists():
+            return nested_path
+        return path
 
     def _has_adapter(self, adapter_name: str) -> bool:
         peft_config = getattr(self.model, "peft_config", None)

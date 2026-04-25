@@ -18,6 +18,7 @@ class FakeBaseModel(torch.nn.Module):
 
 class FakePeftModel(torch.nn.Module):
     saved_adapters: dict[str, dict[str, torch.Tensor]] = {}
+    save_selected_adapters_in_subdirs = False
 
     def __init__(self, base_model: FakeBaseModel) -> None:
         super().__init__()
@@ -60,7 +61,12 @@ class FakePeftModel(torch.nn.Module):
         self.saved_calls.append((str(Path(path)), adapter_names))
         if selected_adapters is None:
             selected_adapters = [self.active_adapter]
-        self.saved_adapters[str(Path(path))] = {
+        save_path = Path(path)
+        if self.save_selected_adapters_in_subdirs and len(selected_adapters) == 1:
+            save_path = save_path / selected_adapters[0]
+        save_path.mkdir(parents=True, exist_ok=True)
+        (save_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+        self.saved_adapters[str(save_path)] = {
             name: self.adapters[name].detach().clone() for name in selected_adapters
         }
 
@@ -228,6 +234,24 @@ def test_layout_snapshots_initial_policy_adapter_and_freezes_reference(
     policy_parameter.data.add_(2.0)
 
     assert not torch.equal(policy_parameter.detach(), reference_parameter.detach())
+
+
+def test_layout_loads_reference_snapshot_from_peft_selected_adapter_subdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_backends(monkeypatch)
+    FakePeftModel.save_selected_adapters_in_subdirs = True
+    try:
+        layout = SharedWeightLayout(
+            model_name="fake/model",
+            lora_config=object(),
+            device="cpu",
+        )
+    finally:
+        FakePeftModel.save_selected_adapters_in_subdirs = False
+
+    assert list(layout.model.adapters.keys()) == ["policy", "reference"]
+    assert layout.model.loaded_adapters[-1] == ("policy", "reference", False)
 
 
 def test_save_adapter_persists_policy_adapter_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
