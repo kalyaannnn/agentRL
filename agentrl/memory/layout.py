@@ -188,21 +188,22 @@ class SharedWeightLayout:
         adapter_dir = Path(adapter_path).expanduser()
         if not adapter_dir.exists():
             raise FileNotFoundError(f"LoRA adapter path does not exist: {adapter_dir}")
+        adapter_load_dir = self._resolve_saved_adapter_path(adapter_dir, self.POLICY_ADAPTER_NAME)
 
         try:
             model = PeftModel.from_pretrained(
                 base_model,
-                adapter_dir,
+                adapter_load_dir,
                 is_trainable=True,
                 adapter_name=self.POLICY_ADAPTER_NAME,
             )
         except TypeError:
             model = PeftModel.from_pretrained(
                 base_model,
-                adapter_dir,
+                adapter_load_dir,
                 is_trainable=True,
             )
-            self._ensure_named_policy_adapter(model, adapter_dir=adapter_dir)
+            self._ensure_named_policy_adapter(model, adapter_dir=adapter_load_dir)
         return model
 
     def _ensure_named_policy_adapter(self, model: nn.Module, adapter_dir: Path | None = None) -> None:
@@ -213,8 +214,9 @@ class SharedWeightLayout:
             return
 
         if adapter_dir is not None and hasattr(model, "load_adapter"):
+            adapter_load_path = self._resolve_saved_adapter_path(adapter_dir, self.POLICY_ADAPTER_NAME)
             model.load_adapter(
-                str(adapter_dir),
+                str(adapter_load_path),
                 adapter_name=self.POLICY_ADAPTER_NAME,
                 is_trainable=True,
             )

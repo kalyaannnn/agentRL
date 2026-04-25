@@ -254,6 +254,30 @@ def test_layout_loads_reference_snapshot_from_peft_selected_adapter_subdir(
     assert layout.model.loaded_adapters[-1] == ("policy", "reference", False)
 
 
+def test_layout_loads_initial_policy_adapter_from_saved_policy_subdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_fake_backends(monkeypatch)
+    adapter_root = tmp_path / "adapter"
+    adapter_policy_dir = adapter_root / "policy"
+    adapter_policy_dir.mkdir(parents=True)
+    (adapter_policy_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    FakePeftModel.saved_adapters[str(adapter_policy_dir)] = {
+        "policy": torch.tensor([2.0]),
+    }
+
+    layout = SharedWeightLayout(
+        model_name="fake/model",
+        lora_config=object(),
+        device="cpu",
+        adapter_path=str(adapter_root),
+    )
+
+    assert torch.equal(layout.model.adapters["policy"].detach(), torch.tensor([2.0]))
+    assert layout.model.loaded_adapters[0] == ("policy", "policy", True)
+
+
 def test_save_adapter_persists_policy_adapter_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_fake_backends(monkeypatch)
 
