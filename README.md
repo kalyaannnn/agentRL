@@ -206,7 +206,18 @@ Observed on a small 16-example evaluation subset:
 | AgentRL | 0.5000 | 0.7500 | 0.6458 | 0.6604 |
 | TRL | 0.5625 | 0.6875 | 0.6458 | 0.6635 |
 
-Interpretation: eval quality was effectively tied on this tiny run, while the AgentRL path exposes the rollout/runtime metrics that make the systems comparison inspectable. These are project validation results, not SOTA claims.
+Interpretation: eval quality was effectively tied on this tiny run, while the AgentRL path exposes the rollout/runtime metrics that make the systems comparison inspectable.
+
+On a small MBPP BYOD code-task systems run, continuous batching versus standard rollout showed:
+
+- 1.54x faster step time
+- 1.56x faster generation
+- 1.55x higher throughput
+- 2842 MB lower rollout VRAM
+- 2842 MB more runtime headroom
+- +0.158 mean reward in that run
+
+These are project validation results from small demo runs, not broad benchmark or SOTA claims.
 
 ## Repository Layout
 
