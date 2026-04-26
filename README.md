@@ -1,20 +1,31 @@
 # AgentRL
 
-Single-GPU rollout/runtime and post-training stack for verifier-based RL: continuous batching, chunked prefill, KV-aware admission, runtime telemetry, supervised bootstrap, GRPO with verifier reward, LoRA adapters, and strict evaluation. Tasks plug in via a small environment/verifier interface; optional BYOD helpers cover common single-turn setups.
+AgentRL is a single-GPU rollout/runtime and post-training stack for verifier-based RL. It is built to show three things together:
 
-**Constraints:** one CUDA GPU (CPU OK for smoke tests). No multi-node or multi-GPU orchestration.
+- **Systems understanding**: grouped generation, continuous batching, chunked prefill, KV-aware admission, runtime headroom tracking, and rollout telemetry on one GPU.
+- **Post-training workflow**: supervised bootstrap, LoRA adapter reuse, verifier-based GRPO, checkpointing, and strict evaluation.
+- **Task abstraction**: bring your own dataset, verifier, and environment through a small task interface, or use a lightweight BYOD helper for common single-turn tasks.
 
-**Design stance:** not aimed at cold-start RL from a base model alone. Sparse verifier signal is usually insufficient without a bootstrap policy that already lands some correct trajectories; the stack assumes supervised warm-start, rollout diagnosis, optional shaped reward during training only when useful, and strict evaluation at the end.
+The intended benchmark story is **not cold-start RL**. Sparse verifier reward is usually too weak for serious tasks unless the starting policy can already sample some correct trajectories. AgentRL is designed around:
 
-## Components
+1. bootstrap a task-specific adapter with supervised data
+2. diagnose whether the bootstrap policy samples correct trajectories
+3. continue with verifier-based GRPO from that adapter
+4. evaluate the saved RL adapter strictly
 
-| Area | Contents |
-|------|----------|
-| Runtime | Standard and continuous batching, chunked prefill, persistent-KV decode where supported, controller signals, bottleneck tooling |
-| Training | TRL-compatible clipped GRPO path, verifier-driven reward, adapter reuse and checkpointing |
-| Tasks | Dataset/verifier/environment not tied to one benchmark; full control via `BaseEnvironment` / `BaseVerifier`, or high-level BYOD (`BYODRecord`, `make_single_turn_task`) for single-turn `prompt → response → verify` flows |
+**Hardware:** one CUDA GPU, or CPU for small smoke tests. AgentRL does not provide multi-node or multi-GPU orchestration.
 
-Custom tasks extend `BaseEnvironment.reset`, `step`, `state`, and `BaseVerifier.verify(response, env_state)`.
+## What It Is
+
+AgentRL is best understood as three connected layers.
+
+| Layer | What it demonstrates |
+| --- | --- |
+| Runtime | Standard and continuous batching, chunked prefill, persistent-KV decode where supported, paged-KV continuous mode, scheduler/controller signals, and bottleneck diagnosis |
+| Training | TRL-compatible clipped GRPO path, verifier-driven reward, SFT bootstrap, LoRA adapter reuse, checkpoints, and final adapter aliases |
+| Tasks | `BaseEnvironment` / `BaseVerifier` for custom tasks, plus `BYODRecord` / `make_single_turn_task` for common single-turn `prompt -> response -> verify` workflows |
+
+The public demo shape should preserve all three: systems proof, post-training proof, and task portability. See [docs/open_source_demo.md](docs/open_source_demo.md) for the full walkthrough.
 
 ## Install
 
@@ -23,13 +34,13 @@ pip install -e .
 pip install -e ".[benchmark]"
 ```
 
-Optional:
+Optional development extras:
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-## Example
+## Minimal GRPO Example
 
 ```python
 from agentrl import GRPOConfig, GRPOTrainer
@@ -53,21 +64,21 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
-## Repository layout
+## Recommended Workflow
 
-- `agentrl/` — runtime, rollout, training, public APIs
-- `examples/` — small runnable entry points
-- `notebooks/` — demos (MBPP BYOD code task)
-- `docs/` — integration and demo guides
-- `tests/` — runtime, trainer, task checks
+For real tasks, use the bootstrap-first loop:
 
-## V2 Runtime Benchmark
+1. Build or load task records.
+2. Train a supervised LoRA adapter with task-specific targets.
+3. Run diagnostic evaluation to check `pass@1`, `pass@k`, response length, and verifier behavior.
+4. Run GRPO initialized from the bootstrap adapter only if the policy has nonzero useful signal.
+5. Evaluate the saved RL adapter with the strict verifier.
 
-The runtime benchmark now supports a short-horizon task-backed multi-turn stub
-in addition to the legacy math workload. This is the intended `v2` finish-line
-benchmark: a deterministic tool-use task that stresses uneven decode lengths,
-growing transcript context, and scheduler / KV behavior without hardbaking any
-agent schema into the library.
+This matters because high strict-eval rewards from cold-start RL are usually not a reliable public story. AgentRL is built around a practical post-training workflow: bootstrap first, diagnose before RL, use shaped reward during RL only when useful, and keep final evaluation strict.
+
+## Systems Benchmark
+
+Use the systems benchmark to compare rollout implementations, runtime bottlenecks, VRAM pressure, cache reuse, scheduler KV pressure, and task reward on the same workload.
 
 ```bash
 python -m examples.benchmark_systems \
@@ -89,21 +100,135 @@ This compares:
 - legacy continuous batching
 - paged-KV continuous batching
 
-and preserves both systems metrics and task reward so the runtime comparison
-stays grounded in a real multi-turn workload.
+Optional speculative decoding runs can be included with `--include-speculative`.
 
+The benchmark writes per-mode summaries plus `comparison.json`. The main signals to inspect are:
 
-## Out of scope (current open-source shape)
+- `mean_step_time_ms`
+- `mean_tokens_per_second`
+- `mean_padding_ratio`
+- `mean_cache_reuse_effectiveness`
+- `mean_scheduler_kv_pressure`
+- `mean_scheduler_deferred_sequences`
+- `mean_scheduler_max_concurrent_sequences`
+- `mean_reward`
+- `peak_vram_mb`
+- `min_rollout_runtime_headroom_mb`
+- `dominant_runtime_bottleneck`
+- `efficiency_diagnosis`
+- `comparison_verdict`
 
-Not a production serving engine, multi-node trainer, hosted task platform, or hardened sandbox. Model-generated code in demos runs in a subprocess for evaluation only. Advanced runtime items (e.g. paged-KV-style work) are tracked separately from the validated v1 runtime story.
+The benchmark is useful even when task reward is not the interesting part: it isolates rollout behavior and makes clear whether a run was decode-limited, padding-limited, prefill-limited, or KV-budget-limited.
 
-## Documentation
+## Bring Your Own Task
 
-- [Bring your own task](docs/bring_your_own_task.md)
-- [Open-source demo](docs/open_source_demo.md)
-- [MBPP BYOD notebook](notebooks/codeDemo.ipynb)
+AgentRL supports two task integration paths.
+
+### High-Level BYOD Path
+
+Use `BYODRecord` and `make_single_turn_task(...)` when your task is a common single-turn `prompt -> response -> verifier` setup.
+
+```python
+from agentrl import BYODRecord, make_single_turn_task
+
+records = [
+    BYODRecord(
+        input="Return exactly: ok",
+        reference_answer="ok",
+        supervised_target="ok",
+    )
+]
+
+task = make_single_turn_task(
+    records=records,
+    prompt_formatter=lambda record, tokenizer: f"User:\n{record.input}\n\nAssistant:\n",
+    reward_fn=lambda response, state: 1.0 if response.strip() == state["reference_answer"] else 0.0,
+    supervised_target_fn=lambda record: record.supervised_target,
+)
+```
+
+This path keeps the public API small while still supporting custom prompts, deterministic reward logic, and supervised bootstrap targets. Start with [docs/bring_your_own_task.md](docs/bring_your_own_task.md) for the v1 onboarding guide.
+
+### Low-Level Custom Task Path
+
+Use `BaseEnvironment` and `BaseVerifier` directly when you need custom state, task-specific transitions, multi-turn rollouts, or richer verifier logic.
+
+Custom tasks implement:
+
+- `BaseEnvironment.reset()`
+- `BaseEnvironment.step(action)`
+- `BaseEnvironment.state()`
+- `BaseVerifier.verify(response, env_state)`
+
+## Public Demo Paths
+
+The strongest public story is:
+
+1. **Systems proof**: compare standard, continuous, and paged-KV continuous rollouts on the same model, workload, and decode budget.
+2. **Post-training proof**: run `bootstrap -> diagnostic eval -> GRPO -> final eval` on one primary task.
+3. **Task abstraction proof**: show the same lifecycle on a BYOD task with a custom verifier.
+
+Useful entry points:
+
+- [docs/open_source_demo.md](docs/open_source_demo.md)
+- [docs/bring_your_own_task.md](docs/bring_your_own_task.md)
+- [notebooks/codeDemo.ipynb](notebooks/codeDemo.ipynb)
+- [notebooks/agentrl_trl_15b_t4_demo.ipynb](notebooks/agentrl_trl_15b_t4_demo.ipynb)
+
+For the single-turn MBPP comparison harness:
+
+```bash
+python -m examples.compare_single_turn_baselines \
+  --model Qwen/Qwen2.5-1.5B-Instruct \
+  --limit 32 \
+  --steps 1 \
+  --batch-size 1 \
+  --group-size 4 \
+  --output-dir ./outputs/single_turn_compare
+```
+
+## Validation Snapshot
+
+Recent Colab T4 results on the MBPP BYOD code-task demo show the intended comparison shape rather than a broad benchmark claim.
+
+Fair-track AgentRL vs TRL setup:
+
+- same MBPP task construction
+- same prompt and supervised-target shape
+- same shaped reward function
+- same strict held-out functional evaluation
+- SFT bootstrap before GRPO
+
+Observed on a small 16-example evaluation subset:
+
+| Framework | Strict pass rate | Any pass rate | Mean test-pass fraction | Mean eval reward |
+| --- | ---: | ---: | ---: | ---: |
+| AgentRL | 0.5000 | 0.7500 | 0.6458 | 0.6604 |
+| TRL | 0.5625 | 0.6875 | 0.6458 | 0.6635 |
+
+Interpretation: eval quality was effectively tied on this tiny run, while the AgentRL path exposes the rollout/runtime metrics that make the systems comparison inspectable. These are project validation results, not SOTA claims.
+
+## Repository Layout
+
+- `agentrl/` - runtime, rollout, training, task APIs, memory, and observability
+- `examples/` - runnable training, evaluation, benchmark, and comparison scripts
+- `notebooks/` - demo notebooks
+- `docs/` - BYOD, demo, benchmark, and planning notes
+- `tests/` - automated validation of runtime, trainer, task, and example behavior
+
+## What AgentRL Is Not
+
+AgentRL is not, in its current open-source shape:
+
+- a production serving engine
+- a multi-node training stack
+- a hosted task platform
+- a hardened sandbox for executing untrusted code
+- a broad benchmark or SOTA claim
+
+The validated story is a research-grade single-GPU rollout/runtime and post-training stack. More advanced runtime-engine work, including paged-KV-style improvements, belongs to the v2 track rather than a production serving claim.
 
 ## Security
 
-- Replay trajectories use `torch.load(..., weights_only=False)` — do not load untrusted trajectory files.
-- Execution-based demos are demo-grade isolation, not a security boundary for untrusted code.
+- Replay trajectories use `torch.load(..., weights_only=False)`. Do not load untrusted trajectory files.
+- Execution-based code-task demos may run model-generated Python in a subprocess for evaluation. This is demo-grade isolation, not a security boundary.
