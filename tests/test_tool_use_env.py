@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from agentrl import AgentTrajectory
 from examples.tool_use_env import ToolUseEnvironment, ToolUseTask, ToolUseVerifier
 
 
@@ -30,6 +31,7 @@ def test_tool_use_environment_progresses_through_short_horizon_episode() -> None
     assert final_done is True
     assert state["success"] is True
     assert state["completed_tool_steps"] >= 1
+    assert isinstance(state["trajectory"], AgentTrajectory)
     assert verifier.verify("FINAL: 4", state) == 1.0
 
 
