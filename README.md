@@ -1,10 +1,10 @@
 # AgentRL
 
-AgentRL is a single-GPU rollout, runtime, and post-training stack for verifier-trained agents. It is intentionally scoped as a research-grade systems project: small enough to inspect, but complete enough to show how rollout efficiency, task abstraction, and verifier-based RL fit together.
+AgentRL is a single-GPU inference/rollout runtime and post-training stack for verifier-trained agents. It is intentionally scoped as a research-grade ML systems project: small enough to inspect, but complete enough to show how inference efficiency, task abstraction, and verifier-based RL fit together.
 
 The project demonstrates three things:
 
-- **Single-GPU agent systems**: grouped multi-turn rollouts, continuous batching, chunked prefill, KV-aware admission, runtime headroom tracking, and rollout telemetry on one GPU.
+- **Inference runtime systems**: grouped multi-turn rollouts, continuous batching, chunked prefill, KV-aware admission, runtime headroom tracking, and rollout telemetry on one GPU.
 - **Post-training workflow**: supervised bootstrap, LoRA adapter reuse, verifier-based GRPO, checkpointing, and strict evaluation.
 - **Task scaffold**: first-class deterministic tool-agent tasks for multi-turn workloads, low-level custom environments, and a lightweight BYOD helper for simple single-turn tasks.
 
@@ -24,13 +24,25 @@ The intended story is **not cold-start RL**. Sparse verifier reward is usually t
 - **Practical post-training shape:** the recommended workflow is `SFT bootstrap -> diagnostic eval -> GRPO -> strict final eval`, with adapter reuse throughout.
 - **Pluggable task surface:** users can start with the high-level multi-turn tool-agent scaffold, a high-level single-turn BYOD helper, or the low-level environment/verifier contracts.
 
+## Inference Engineering Focus
+
+AgentRL is written to make the inference side of agent training visible, not hidden behind a trainer wrapper. The runtime path focuses on the same problems that dominate production agent serving and high-throughput rollout collection:
+
+- **Batching and scheduling:** standard rollout, continuous batching, length-aware ordering, scheduler admission budgets, deferred sequence tracking, and max-concurrency telemetry.
+- **KV-cache pressure:** per-token KV estimates, chunked prefill sizing, persistent-cache decode where supported, paged-KV allocator experiments, block reuse counters, and allocator-pressure diagnostics.
+- **GPU and memory observability:** per-phase timing, CUDA VRAM peaks, runtime headroom, torch profiler trace export, decode/prefill token rates, and actionable bottleneck labels.
+- **Agent-serving workload shape:** multi-turn tool-use episodes with growing transcript context, uneven completion, deterministic verifier state, and reward stability checks under different runtime modes.
+- **Benchmark discipline:** same model, workload, decode budget, batch size, and group size across runtime modes, with JSON artifacts for latency, throughput, memory, scheduler behavior, and quality.
+
+The current implementation is PyTorch-first and intentionally honest about scope. It does not claim to be vLLM, TensorRT, Triton Inference Server, or a custom CUDA/C++ kernel project. Instead, it demonstrates the surrounding inference-system instincts: measure the bottleneck, control memory pressure, schedule active sequences, preserve output quality, and identify where lower-level kernels or serving infrastructure would matter next.
+
 ## Architecture
 
 AgentRL is best understood as three connected layers.
 
 | Layer | What it demonstrates |
 | --- | --- |
-| Runtime | Standard and continuous batching for multi-turn grouped rollouts, chunked prefill, persistent-KV decode where supported, paged-KV continuous mode, scheduler/controller signals, and bottleneck diagnosis |
+| Runtime | Standard and continuous batching for multi-turn grouped rollouts, chunked prefill, persistent-KV decode where supported, paged-KV continuous mode, scheduler/controller signals, profiler traces, and bottleneck diagnosis |
 | Training | TRL-compatible clipped GRPO path, verifier-driven reward, SFT bootstrap, LoRA adapter reuse, checkpoints, and final adapter aliases |
 | Tasks | `AgentTaskRecord` / `ToolSpec` / `make_tool_agent_task` for deterministic multi-turn tool agents, `BaseEnvironment` / `BaseVerifier` for custom tasks, and `BYODRecord` / `make_single_turn_task` for single-turn `prompt -> response -> verify` workflows |
 
@@ -107,7 +119,7 @@ For nontrivial tasks, use the bootstrap-first loop:
 
 This matters because high strict-eval rewards from cold-start RL are usually not a reliable public story. AgentRL is built around a practical post-training workflow: bootstrap first, diagnose before RL, use shaped reward during RL only when useful, and keep final evaluation strict.
 
-## Systems Benchmark
+## Inference Runtime Benchmark
 
 Use the systems benchmark to compare rollout implementations, runtime bottlenecks, VRAM pressure, cache reuse, scheduler KV pressure, and task reward on the same workload.
 
@@ -151,7 +163,7 @@ The benchmark writes per-mode summaries plus `comparison.json`. The main signals
 - `efficiency_diagnosis`
 - `comparison_verdict`
 
-The benchmark is useful even when task reward is not the interesting part: it isolates rollout behavior and makes clear whether a multi-turn run was decode-limited, padding-limited, prefill-limited, or KV-budget-limited.
+The benchmark is useful even when task reward is not the interesting part: it isolates rollout behavior and makes clear whether a multi-turn run was decode-limited, padding-limited, prefill-limited, memory-headroom-limited, or KV-budget-limited.
 
 ## Task Integration
 
@@ -285,10 +297,11 @@ These are project validation results from small demo runs, not broad benchmark o
 
 ## Interview Talking Points
 
-- I built AgentRL to make verifier-based RL systems behavior measurable on one GPU, not to claim distributed serving scale.
-- The runtime story is about controlling rollout cost: batching mode, padding waste, KV pressure, cache reuse, scheduler deferrals, and VRAM headroom are all surfaced in benchmark artifacts.
+- I built AgentRL to make the inference/runtime side of verifier-based agent RL measurable on one GPU, not to claim distributed serving scale.
+- The runtime story maps directly to inference engineering: batching mode, padding waste, decode/prefill split, KV-cache pressure, cache reuse, scheduler deferrals, VRAM headroom, and bottleneck labels are all emitted as benchmark artifacts.
+- The workload is agent-shaped rather than synthetic only: multi-turn tool-use episodes grow context over time and finish at uneven lengths, which stresses continuous batching and KV admission decisions.
 - The training story is deliberately bootstrap-first. GRPO is run from a supervised LoRA adapter because sparse verifier reward is only useful once the policy can already produce some correct trajectories.
-- The task story is portability. Multi-turn tool agents, single-turn BYOD records, and fully custom environments all adapt to the same trainer-facing contracts.
+- The project is PyTorch-first today; the next natural deepening points are kernel-level profiling, custom Triton/CUDA kernels for critical operations, and integration with production serving stacks such as vLLM or TensorRT when the bottleneck justifies it.
 - The validation snapshot is intentionally modest and honest: small demo runs show comparable task quality to TRL while exposing additional runtime telemetry.
 
 ## Repository Layout
@@ -309,7 +322,7 @@ AgentRL is not, in its current open-source shape:
 - a hardened sandbox for executing untrusted code
 - a broad benchmark or SOTA claim
 
-The validated story is a research-grade single-GPU rollout/runtime and post-training scaffold for multi-turn agent workloads. More advanced runtime-engine work, including paged-KV-style improvements, belongs to the v2 track rather than a production serving claim.
+The validated story is a research-grade single-GPU inference/rollout runtime and post-training scaffold for multi-turn agent workloads. More advanced runtime-engine work, including paged-KV-style improvements and kernel-level optimization, belongs to the v2 track rather than a production serving claim.
 
 ## Security
 
