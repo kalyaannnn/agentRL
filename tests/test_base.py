@@ -68,6 +68,7 @@ def test_config_defaults_match_prompt_surface() -> None:
     assert config.use_async_rollout_workers is False
     assert config.use_async_trajectory_copy is False
     assert config.experimental_vllm_rollout is False
+    assert config.use_triton_kernels is False
     assert config.top_p == 1.0
     assert config.stop_strings == ()
 

@@ -18,6 +18,9 @@ dev = [
 benchmark = [
     "datasets>=2.19.0",
 ]
+triton = [
+    "triton>=2.3.0; platform_system == 'Linux'",
+]
 
 [build-system]
 requires = ["hatchling"]

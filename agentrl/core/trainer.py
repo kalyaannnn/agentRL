@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import importlib.util
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,10 @@ class GRPOObjectiveStats:
     clip_ratio_region_mean: float
     clip_ratio_low_mean: float
     clip_ratio_high_mean: float
+    triton_kernel_requested: bool = False
+    triton_kernel_used: bool = False
+    triton_kernel_target: str = "none"
+    triton_fallback_reason: str = ""
 
     @property
     def policy_loss(self) -> float:
@@ -118,8 +123,53 @@ def _compute_clipped_grpo_objective(
     beta: float,
     ref_logprobs: torch.Tensor | None,
     clip_range: float,
+    use_triton_kernel: bool = False,
 ) -> GRPOObjectiveStats:
     """Compute the sampled-token clipped GRPO objective and parity metrics."""
+
+    triton_kernel_target = "grpo_objective" if use_triton_kernel else "none"
+    triton_fallback_reason = ""
+    if use_triton_kernel and beta == 0.0:
+        triton_result = None
+        if not current_logprobs.is_cuda:
+            triton_fallback_reason = "cuda_unavailable"
+        elif importlib.util.find_spec("triton") is None:
+            triton_fallback_reason = "triton_unavailable"
+        else:
+            try:
+                from agentrl.kernels import triton_clipped_grpo_objective
+
+                triton_result = triton_clipped_grpo_objective(
+                    current_logprobs=current_logprobs,
+                    old_logprobs=old_logprobs,
+                    advantages=advantages,
+                    sampled_token_mask=sampled_token_mask,
+                    epsilon=epsilon,
+                    clip_range=clip_range,
+                )
+            except ImportError:
+                triton_fallback_reason = "triton_unavailable"
+        if triton_result is not None:
+            zero = triton_result.policy_loss_tensor.new_zeros(())
+            return GRPOObjectiveStats(
+                policy_loss_tensor=triton_result.policy_loss_tensor,
+                kl_loss_tensor=zero,
+                total_loss_tensor=triton_result.policy_loss_tensor,
+                mean_ratio=float(triton_result.mean_ratio_tensor.detach().item()),
+                mean_token_kl=0.0,
+                clip_ratio_region_mean=float(
+                    triton_result.clip_ratio_region_mean_tensor.detach().item()
+                ),
+                clip_ratio_low_mean=float(triton_result.clip_ratio_low_mean_tensor.detach().item()),
+                clip_ratio_high_mean=float(triton_result.clip_ratio_high_mean_tensor.detach().item()),
+                triton_kernel_requested=True,
+                triton_kernel_used=True,
+                triton_kernel_target=triton_kernel_target,
+            )
+        if not triton_fallback_reason:
+            triton_fallback_reason = "unsupported_layout_or_dtype"
+    elif use_triton_kernel and beta > 0.0:
+        triton_fallback_reason = "kl_enabled"
 
     broadcast_advantages = advantages.to(
         device=current_logprobs.device,
@@ -164,6 +214,10 @@ def _compute_clipped_grpo_objective(
         clip_ratio_high_mean=float(
             _masked_token_mean(high_clip.to(dtype=current_logprobs.dtype), sampled_token_mask).detach().item()
         ),
+        triton_kernel_requested=use_triton_kernel,
+        triton_kernel_used=False,
+        triton_kernel_target=triton_kernel_target,
+        triton_fallback_reason=triton_fallback_reason,
     )
 
 
@@ -452,6 +506,7 @@ class GRPOTrainer:
                 beta=self.current_beta,
                 ref_logprobs=ref_logprobs,
                 clip_range=self.config.clip_range,
+                use_triton_kernel=self.config.use_triton_kernels,
             )
 
         scaled_loss = objective.total_loss_tensor / float(self.config.gradient_accumulation_steps)
@@ -490,6 +545,10 @@ class GRPOTrainer:
             "clip_ratio/low_mean": objective.clip_ratio_low_mean,
             "clip_ratio/high_mean": objective.clip_ratio_high_mean,
             "mean_ratio": objective.mean_ratio,
+            "triton_kernel_requested": float(objective.triton_kernel_requested),
+            "triton_kernel_used": float(objective.triton_kernel_used),
+            "triton_kernel_target": objective.triton_kernel_target,
+            "triton_fallback_reason": objective.triton_fallback_reason or "none",
         }
 
     def _build_lr_scheduler(self):

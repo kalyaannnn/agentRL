@@ -103,6 +103,7 @@ class GRPOConfig:
     use_async_trajectory_copy: bool = False
     async_trajectory_max_pending_batches: int = 2
     experimental_vllm_rollout: bool = False
+    use_triton_kernels: bool = False
     _output_path: Path = field(init=False, repr=False)
     _profile_path: Path = field(init=False, repr=False)
 

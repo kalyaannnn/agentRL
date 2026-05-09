@@ -764,6 +764,86 @@ def test_benchmark_systems_supports_tool_use_task(monkeypatch, tmp_path) -> None
     assert '"mode_name": "continuous batching"' in summary
 
 
+def test_benchmark_systems_passes_triton_and_profile_flags(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    class StubTrainer:
+        def __init__(self, config, environment, verifier):
+            del environment, verifier
+            captured["config"] = config
+
+        def train(self):
+            return [
+                {
+                    "mean_reward": 0.5,
+                    "reward_std": 0.25,
+                    "total_step_time_ms": 120.0,
+                    "generation_time_ms": 72.0,
+                    "training_time_ms": 48.0,
+                    "tokens_per_second": 18.0,
+                    "prefill_tokens_per_second": 28.0,
+                    "decode_tokens_per_second": 14.0,
+                    "padding_ratio": 0.12,
+                    "generation_padding_ratio": 0.18,
+                    "sequence_padding_ratio": 0.09,
+                    "cache_reuse_effectiveness": 0.75,
+                    "peak_vram_mb": 130.0,
+                    "rollout_peak_vram_mb": 118.0,
+                    "rollout_runtime_headroom_mb": 430.0,
+                    "runtime_adjustments": 0.0,
+                    "runtime_low_headroom": 0.0,
+                    "dominant_runtime_bottleneck": "decode",
+                    "runtime_recommendation": "Decode dominates.",
+                    "last_runtime_adjustment_reason": "none",
+                    "triton_kernel_requested": 1.0,
+                    "triton_kernel_used": 0.0,
+                    "triton_kernel_target": "grpo_objective",
+                    "triton_fallback_reason": "cuda_unavailable",
+                }
+            ]
+
+    monkeypatch.setattr(benchmark_systems, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_systems.py",
+            "--model",
+            "fake/model",
+            "--steps",
+            "1",
+            "--batch-size",
+            "1",
+            "--group-size",
+            "2",
+            "--max-new-tokens",
+            "24",
+            "--profile-steps",
+            "1",
+            "--profile-dir",
+            str(tmp_path / "profiles"),
+            "--use-triton-kernels",
+            "--output-dir",
+            str(tmp_path / "systems_triton"),
+        ],
+    )
+
+    benchmark_systems_main()
+
+    config = captured["config"]
+    assert config.use_triton_kernels is True
+    assert config.profile_steps == 1
+    assert config.profile_path == tmp_path / "profiles"
+
+    summary = (tmp_path / "systems_triton" / "summary.json").read_text(encoding="utf-8")
+    assert '"triton_kernel_requested_rate": 1.0' in summary
+    assert '"triton_kernel_used_rate": 0.0' in summary
+    assert '"triton_kernel_target_counts": {' in summary
+    assert '"grpo_objective": 1' in summary
+    assert '"triton_fallback_reason_counts": {' in summary
+    assert '"cuda_unavailable": 1' in summary
+
+
 def test_benchmark_systems_reports_paged_kv_diagnosis(monkeypatch, tmp_path) -> None:
     class StubTrainer:
         def __init__(self, config, environment, verifier):

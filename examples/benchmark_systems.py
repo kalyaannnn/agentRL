@@ -71,6 +71,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also include a speculative decoding AgentRL runtime mode in comparisons.",
     )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=None,
+        help="Export PyTorch profiler traces for the first N training steps.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default="./profiles",
+        help="Directory for PyTorch profiler traces when --profile-steps is set.",
+    )
+    parser.add_argument(
+        "--use-triton-kernels",
+        action="store_true",
+        help="Enable optional Triton kernels when CUDA, Triton, and tensor layouts support them.",
+    )
     return parser
 
 
@@ -128,6 +144,16 @@ def _summarize_run(
         if str(row.get("last_runtime_adjustment_reason", "none")) != "none"
     )
     recommendation_counts = Counter(str(row.get("runtime_recommendation", "")) for row in history if row.get("runtime_recommendation"))
+    triton_target_counts = Counter(
+        str(row.get("triton_kernel_target", "none"))
+        for row in history
+        if str(row.get("triton_kernel_target", "none")) != "none"
+    )
+    triton_fallback_reason_counts = Counter(
+        str(row.get("triton_fallback_reason", "none"))
+        for row in history
+        if str(row.get("triton_fallback_reason", "none")) != "none"
+    )
     dominant_bottleneck = bottleneck_counts.most_common(1)[0][0] if bottleneck_counts else "unknown"
     top_recommendation = recommendation_counts.most_common(1)[0][0] if recommendation_counts else ""
     efficiency_diagnosis = _diagnose_run(history, dominant_bottleneck, adjustment_reason_counts)
@@ -198,6 +224,12 @@ def _summarize_run(
         "rollout_peak_vram_mb": max(float(row.get("rollout_peak_vram_mb", 0.0)) for row in history),
         "min_rollout_runtime_headroom_mb": min(float(row.get("rollout_runtime_headroom_mb", 0.0)) for row in history),
         "mean_runtime_adjustments": mean(float(row.get("runtime_adjustments", 0.0)) for row in history),
+        "triton_kernel_requested_rate": mean(
+            float(row.get("triton_kernel_requested", 0.0)) for row in history
+        ),
+        "triton_kernel_used_rate": mean(float(row.get("triton_kernel_used", 0.0)) for row in history),
+        "triton_kernel_target_counts": dict(sorted(triton_target_counts.items())),
+        "triton_fallback_reason_counts": dict(sorted(triton_fallback_reason_counts.items())),
         "steps_with_runtime_adjustment": sum(1 for row in history if float(row.get("runtime_adjustments", 0.0)) > 0.0),
         "steps_with_low_headroom": sum(1 for row in history if float(row.get("runtime_low_headroom", 0.0)) > 0.0),
         "dominant_runtime_bottleneck": dominant_bottleneck,
@@ -314,6 +346,9 @@ def _run_one(
         use_paged_kv_continuous=use_paged_kv_continuous,
         use_speculative_decoding=use_speculative_decoding,
         draft_model_name=args.draft_model if use_speculative_decoding else None,
+        profile_steps=args.profile_steps,
+        profile_dir=args.profile_dir,
+        use_triton_kernels=args.use_triton_kernels,
     )
     environment, verifier = _build_task(args.task, args.split)
     trainer = GRPOTrainer(
