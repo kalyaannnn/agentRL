@@ -1,6 +1,6 @@
 # AgentRL
 
-AgentRL is a single-GPU inference/rollout runtime and post-training stack for verifier-trained agents. It is intentionally scoped as a research-grade ML systems project: small enough to inspect, but complete enough to show how inference efficiency, task abstraction, and verifier-based RL fit together.
+AgentRL is a single-GPU inference/rollout runtime and post-training stack for verifier-trained agents. It is a research-grade ML systems project: small enough to inspect end to end, but complete enough to show how rollout efficiency, task abstraction, and verifier-based RL fit together.
 
 The project demonstrates three things:
 
@@ -8,14 +8,14 @@ The project demonstrates three things:
 - **Post-training workflow**: supervised bootstrap, LoRA adapter reuse, verifier-based GRPO, checkpointing, and strict evaluation.
 - **Task scaffold**: first-class deterministic tool-agent tasks for multi-turn workloads, low-level custom environments, and a lightweight BYOD helper for simple single-turn tasks.
 
-The intended story is **not cold-start RL**. Sparse verifier reward is usually too weak for serious tasks unless the starting policy can already sample useful trajectories. AgentRL is designed around a more realistic loop:
+The intended story is **not cold-start RL**. Sparse verifier reward is usually too weak for serious tasks unless the starting policy can already sample useful trajectories. AgentRL is designed around a practical public workflow:
 
 1. bootstrap a task-specific adapter with supervised data
 2. diagnose whether the bootstrap policy samples useful trajectories
 3. continue with verifier-based GRPO from that adapter
 4. evaluate the saved RL adapter strictly
 
-**Hardware:** one CUDA GPU, or CPU for small smoke tests. AgentRL does not provide multi-node or multi-GPU orchestration.
+**Hardware:** one CUDA GPU for the systems path, or CPU for small smoke tests. AgentRL does not provide multi-node or multi-GPU orchestration.
 
 ## Project Highlights
 
@@ -50,6 +50,8 @@ The public demo shape should preserve all three: systems proof on multi-turn age
 
 ## Quick Start
 
+Install the package and benchmark extras:
+
 ```bash
 pip install -e .
 pip install -e ".[benchmark]"
@@ -59,6 +61,12 @@ Optional development extras:
 
 ```bash
 pip install -e ".[dev]"
+```
+
+Optional Triton kernels for CUDA systems experiments:
+
+```bash
+pip install -e ".[triton]"
 ```
 
 Run the smoke-sized GRPO example:
@@ -82,6 +90,8 @@ python -m examples.benchmark_systems \
   --output-dir ./systems_benchmark_compare \
   --compare-runtime-modes
 ```
+
+For profile-guided CUDA work, see [docs/triton_profile_workflow.md](docs/triton_profile_workflow.md).
 
 ## Minimal GRPO Example
 
@@ -247,6 +257,7 @@ The strongest public story is:
 Useful entry points:
 
 - [docs/open_source_demo.md](docs/open_source_demo.md)
+- [docs/triton_profile_workflow.md](docs/triton_profile_workflow.md)
 - [docs/multi_turn_agents.md](docs/multi_turn_agents.md)
 - [docs/bring_your_own_task.md](docs/bring_your_own_task.md)
 - [notebooks/codeDemo.ipynb](notebooks/codeDemo.ipynb)
@@ -295,9 +306,9 @@ On a small MBPP BYOD code-task systems run, continuous batching versus standard 
 
 These are project validation results from small demo runs, not broad benchmark or SOTA claims.
 
-## Interview Talking Points
+## Positioning Notes
 
-- I built AgentRL to make the inference/runtime side of verifier-based agent RL measurable on one GPU, not to claim distributed serving scale.
+- AgentRL makes the inference/runtime side of verifier-based agent RL measurable on one GPU; it does not claim distributed serving scale.
 - The runtime story maps directly to inference engineering: batching mode, padding waste, decode/prefill split, KV-cache pressure, cache reuse, scheduler deferrals, VRAM headroom, and bottleneck labels are all emitted as benchmark artifacts.
 - The workload is agent-shaped rather than synthetic only: multi-turn tool-use episodes grow context over time and finish at uneven lengths, which stresses continuous batching and KV admission decisions.
 - The training story is deliberately bootstrap-first. GRPO is run from a supervised LoRA adapter because sparse verifier reward is only useful once the policy can already produce some correct trajectories.
