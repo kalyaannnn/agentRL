@@ -683,10 +683,8 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 )
                 self._runtime_stats["prefill_tokens"] += float(prompt_tokens)
 
-            if prefix_cache is not None:
-                sequence_cache = self._cache_to_legacy(sequence_cache)
             self._store_prompt_in_prefix_cache(prompt, sequence_cache, sequence_logits)
-            return sequence_logits, sequence_cache
+            return sequence_logits, self._forward_cache(sequence_cache)
         finally:
             if prefix_cache is not None and handle is not None:
                 prefix_cache.release(handle)
@@ -726,7 +724,10 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         )
         suffix = prompt[matched_len:]
         if suffix.numel() == 0 and matched_blocks[-1].end_logits is not None:
-            return matched_blocks[-1].end_logits.to(self.device), prefix_legacy_cache
+            return (
+                matched_blocks[-1].end_logits.to(self.device),
+                self._forward_cache(prefix_legacy_cache),
+            )
         if suffix.numel() == 0:
             return self._prefill_full_prompt(
                 generation_model=generation_model,
@@ -737,10 +738,10 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         outputs = generation_model(
             input_ids=suffix.unsqueeze(0),
             attention_mask=prompt_mask.unsqueeze(0),
-            past_key_values=prefix_legacy_cache,
+            past_key_values=self._forward_cache(prefix_legacy_cache),
             use_cache=True,
         )
-        return outputs.logits[:, -1, :], outputs.past_key_values
+        return outputs.logits[:, -1, :], self._forward_cache(outputs.past_key_values)
 
     def _store_prompt_in_prefix_cache(
         self,
@@ -909,7 +910,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             generation_model,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
+            past_key_values=self._forward_cache(past_key_values),
         )
         if self.cuda_graph_decode.last_used_graph:
             self._runtime_stats["cuda_graph_decode_used"] += 1.0
@@ -928,6 +929,19 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
 
         forward = getattr(type(generation_model), "forward", None)
         return forward is not None and forward is not nn.Module.forward
+
+    def _forward_cache(self, cache: Any) -> Any:
+        """Convert stored legacy tuple caches into a Transformers-compatible cache object."""
+
+        if cache is None:
+            return None
+        if DynamicCache is not None and isinstance(cache, DynamicCache):
+            return cache
+        if isinstance(cache, tuple):
+            if DynamicCache is not None:
+                return DynamicCache.from_legacy_cache(cache)
+            return cache
+        return cache
 
     def _stack_past_key_values(self, caches: list[Any]) -> Any:
         """Batch multiple single-sequence cache objects into one cache."""
