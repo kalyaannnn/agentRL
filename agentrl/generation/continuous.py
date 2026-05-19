@@ -931,35 +931,57 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         forward = getattr(type(generation_model), "forward", None)
         return forward is not None and forward is not nn.Module.forward
 
+    @staticmethod
+    def _is_transformers_cache(cache: Any) -> bool:
+        """Return whether *cache* is a HuggingFace-style KV cache (not legacy tuples)."""
+
+        if cache is None or isinstance(cache, tuple):
+            return False
+        if callable(getattr(cache, "get_seq_length", None)):
+            return True
+        return hasattr(cache, "layers") or hasattr(cache, "key_cache")
+
     def _forward_cache(self, cache: Any) -> Any:
         """Convert stored legacy tuple caches into a Transformers-compatible cache object."""
 
         if cache is None:
             return None
-        if DynamicCache is not None and isinstance(cache, DynamicCache):
+        if self._is_transformers_cache(cache):
             return cache
         if isinstance(cache, tuple):
-            if DynamicCache is not None:
-                from_legacy_cache = getattr(DynamicCache, "from_legacy_cache", None)
-                if callable(from_legacy_cache):
-                    return from_legacy_cache(cache)
-                template = self._cache_template_from_model()
-                if isinstance(template, DynamicCache):
-                    return self._construct_dynamic_cache(template, cache)
-                if not isinstance(template, tuple):
-                    return self._cache_from_legacy(template, cache)
-                config = getattr(self.layout.model, "config", None)
-                if config is not None:
-                    try:
-                        return DynamicCache(ddp_cache_data=cache, config=config)
-                    except TypeError:
-                        pass
-                try:
-                    return DynamicCache(ddp_cache_data=cache)
-                except TypeError:
-                    pass
-            return cache
+            return self._legacy_tuple_to_transformers_cache(cache)
         return cache
+
+    def _legacy_tuple_to_transformers_cache(
+        self,
+        legacy_cache: tuple[tuple[torch.Tensor, ...], ...],
+    ) -> Any:
+        """Rebuild a model-compatible cache from legacy ``(key, value)`` layer tuples."""
+
+        template = self._cache_template_from_model()
+        if template is not None and not isinstance(template, tuple):
+            try:
+                return self._construct_dynamic_cache(template, legacy_cache)
+            except (TypeError, ValueError):
+                pass
+            try:
+                return self._cache_from_legacy(template, legacy_cache)
+            except (TypeError, ValueError):
+                pass
+
+        if DynamicCache is not None:
+            config = getattr(self.layout.model, "config", None)
+            constructor_attempts: list[dict[str, Any]] = [{"ddp_cache_data": legacy_cache}]
+            if config is not None:
+                constructor_attempts.insert(
+                    0, {"ddp_cache_data": legacy_cache, "config": config}
+                )
+            for kwargs in constructor_attempts:
+                try:
+                    return DynamicCache(**kwargs)
+                except TypeError:
+                    continue
+        return legacy_cache
 
     def _cache_template_from_model(self) -> Any:
         """Capture one model-emitted cache object to use as a reconstruction template."""
@@ -1189,17 +1211,13 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             return legacy_cache
 
         cache_type = type(cache_like)
-        from_legacy_cache = getattr(cache_type, "from_legacy_cache", None)
-        if not callable(from_legacy_cache):
-            from_legacy_cache = getattr(cache_like, "from_legacy_cache", None)
-        if callable(from_legacy_cache):
-            try:
-                return from_legacy_cache(legacy_cache)
-            except TypeError:
-                pass
+        try:
+            return self._construct_dynamic_cache(cache_like, legacy_cache)
+        except (TypeError, ValueError):
+            pass
 
-        # Newer cache implementations can often be reconstructed directly from
-        # legacy `(key, value)` tuples via their constructor.
+        # Cache implementations can often be reconstructed from legacy tuples
+        # via their constructor without touching ``from_legacy_cache``.
         try:
             return cache_type(ddp_cache_data=legacy_cache)
         except TypeError:
