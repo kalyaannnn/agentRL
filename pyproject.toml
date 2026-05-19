@@ -1,7 +1,7 @@
 [project]
 name = "agentrl"
 version = "0.1.0"
-description = "Single-GPU GRPO post-training framework for pluggable text environments"
+description = "Single-GPU inference runtime and GRPO post-training for multi-turn agent workloads"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,16 +15,10 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
 ]
-benchmark = [
-    "datasets>=2.19.0",
-]
-triton = [
-    "triton>=2.3.0; platform_system == 'Linux'",
-]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]

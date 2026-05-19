@@ -8,7 +8,8 @@ from typing import Any
 __all__ = [
     "ChunkedPrefillMixin",
     "ContinuousBatchingOrchestrator",
-    "SpeculativeRolloutOrchestrator",
+    "CUDAGraphDecodeRunner",
+    "PrefixCache",
     "available_vram_bytes",
     "compute_safe_chunk_size",
     "estimate_kv_cache_bytes",
@@ -25,7 +26,10 @@ def __getattr__(name: str) -> Any:
     if name == "ContinuousBatchingOrchestrator":
         module = import_module("agentrl.generation.continuous")
         return getattr(module, name)
-    if name == "SpeculativeRolloutOrchestrator":
-        module = import_module("agentrl.generation.speculative")
+    if name == "CUDAGraphDecodeRunner":
+        module = import_module("agentrl.generation.cuda_graph_decode")
+        return getattr(module, name)
+    if name == "PrefixCache":
+        module = import_module("agentrl.generation.prefix_cache")
         return getattr(module, name)
     raise AttributeError(f"module 'agentrl.generation' has no attribute {name!r}")

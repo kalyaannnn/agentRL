@@ -1,7 +1,14 @@
+# Kept locally for development; not published to the public GitHub repo.
+tests/
+
 .venv/
 .pytest_cache/
 __pycache__/
 *.pyc
 checkpoints/
 .DS_Store
-notebooks/agentrl_trl_15b_t4_demo.ipynb
+systems_benchmark/
+profiles/
+*.egg-info/
+dist/
+build/

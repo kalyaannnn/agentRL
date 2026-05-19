@@ -6,7 +6,7 @@ import copy
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -29,6 +29,13 @@ class RolloutBatch:
     rewards: torch.Tensor
     advantages: torch.Tensor
     metadata: dict[str, Any]
+
+
+class RolloutSource(Protocol):
+    """Protocol implemented by rollout collectors consumed by the trainer."""
+
+    def collect(self) -> RolloutBatch:
+        """Collect one rollout batch."""
 
 
 class RolloutOrchestrator(ChunkedPrefillMixin):
@@ -533,6 +540,8 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
         prefill_tokens = float(self._runtime_stats["prefill_tokens"])
         decode_tokens = float(self._runtime_stats["decode_tokens"])
         cache_reuse_tokens = float(self._runtime_stats["cache_reuse_tokens"])
+        cache_hit_tokens = float(self._runtime_stats["cache_hit_tokens"])
+        cache_lookup_tokens = float(self._runtime_stats["cache_lookup_tokens"])
         scheduler_prefill_passes = float(self._runtime_stats["scheduler_prefill_passes"])
         scheduler_decode_passes = float(self._runtime_stats["scheduler_decode_passes"])
 
@@ -557,6 +566,20 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "cache_reuse_effectiveness": (
                 cache_reuse_tokens / (cache_reuse_tokens + prefill_tokens)
             ) if (cache_reuse_tokens + prefill_tokens) > 0 else 0.0,
+            "cache_hit_tokens": cache_hit_tokens,
+            "cache_hit_ratio": (
+                cache_hit_tokens / cache_lookup_tokens
+            ) if cache_lookup_tokens > 0 else 0.0,
+            "cache_size_blocks": float(self._runtime_stats["cache_size_blocks"]),
+            "cache_evictions_per_step": float(self._runtime_stats["cache_evictions_per_step"]),
+            "prefill_token_savings_pct": (
+                100.0 * cache_hit_tokens / cache_lookup_tokens
+            ) if cache_lookup_tokens > 0 else 0.0,
+            "cuda_graph_decode_requested": float(self._runtime_stats["cuda_graph_decode_requested"]),
+            "cuda_graph_decode_used": float(self._runtime_stats["cuda_graph_decode_used"]),
+            "cuda_graph_decode_fallbacks": float(self._runtime_stats["cuda_graph_decode_fallbacks"]),
+            "cuda_graph_decode_captures": float(self._runtime_stats["cuda_graph_decode_captures"]),
+            "cuda_graph_decode_fallback_reason": self._runtime_stats["cuda_graph_decode_fallback_reason"],
             "generation_padding_waste_tokens": generation_padding_waste,
             "generation_padding_ratio": (
                 generation_padding_waste / generation_padding_total
@@ -589,32 +612,12 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "scheduler_decode_kv_pressure": (
                 float(self._runtime_stats["scheduler_decode_kv_pressure"]) / scheduler_decode_passes
             ) if scheduler_decode_passes > 0 else 0.0,
-            "scheduler_prefill_block_budget": float(self._runtime_stats["scheduler_prefill_block_budget"]),
-            "scheduler_decode_block_budget": float(self._runtime_stats["scheduler_decode_block_budget"]),
-            "scheduler_prefill_admitted_blocks": float(self._runtime_stats["scheduler_prefill_admitted_blocks"]),
-            "scheduler_decode_admitted_blocks": float(self._runtime_stats["scheduler_decode_admitted_blocks"]),
-            "scheduler_decode_growth_block_demand": float(
-                self._runtime_stats["scheduler_decode_growth_block_demand"]
-            ),
-            "scheduler_decode_growth_blocks_admitted": float(
-                self._runtime_stats["scheduler_decode_growth_blocks_admitted"]
-            ),
             "scheduler_length_sort_passes": float(self._runtime_stats["scheduler_length_sort_passes"]),
             "scheduler_length_sorted_sequences": float(self._runtime_stats["scheduler_length_sorted_sequences"]),
             "scheduler_deferred_sequences": float(self._runtime_stats["scheduler_deferred_sequences"]),
             "scheduler_max_concurrent_sequences": float(
                 self._runtime_stats["scheduler_max_concurrent_sequences"]
             ),
-            "paged_kv_block_size_tokens": float(self._runtime_stats["paged_kv_block_size_tokens"]),
-            "paged_kv_free_block_count": float(self._runtime_stats["paged_kv_free_block_count"]),
-            "paged_kv_used_block_count": float(self._runtime_stats["paged_kv_used_block_count"]),
-            "paged_kv_allocator_occupancy": float(self._runtime_stats["paged_kv_allocator_occupancy"]),
-            "paged_kv_block_reuse_count": float(self._runtime_stats["paged_kv_block_reuse_count"]),
-            "paged_kv_allocator_pressure": float(self._runtime_stats["paged_kv_allocator_pressure"]),
-            "paged_kv_max_blocks_in_use": float(self._runtime_stats["paged_kv_max_blocks_in_use"]),
-            "paged_kv_resident_sequences": float(self._runtime_stats["paged_kv_resident_sequences"]),
-            "paged_kv_preempted_sequences": float(self._runtime_stats["paged_kv_preempted_sequences"]),
-            "paged_kv_max_preempted_sequences": float(self._runtime_stats["paged_kv_max_preempted_sequences"]),
         }
 
     def _reset_runtime_stats(self) -> None:
@@ -626,6 +629,15 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "prefill_tokens": 0.0,
             "decode_tokens": 0.0,
             "cache_reuse_tokens": 0.0,
+            "cache_hit_tokens": 0.0,
+            "cache_lookup_tokens": 0.0,
+            "cache_size_blocks": 0.0,
+            "cache_evictions_per_step": 0.0,
+            "cuda_graph_decode_requested": 0.0,
+            "cuda_graph_decode_used": 0.0,
+            "cuda_graph_decode_fallbacks": 0.0,
+            "cuda_graph_decode_captures": 0.0,
+            "cuda_graph_decode_fallback_reason": "none",
             "generation_padding_waste_tokens": 0.0,
             "generation_padding_total_tokens": 0.0,
             "sequence_padding_waste_tokens": 0.0,
@@ -642,26 +654,10 @@ class RolloutOrchestrator(ChunkedPrefillMixin):
             "scheduler_decode_admitted_kv_mb": 0.0,
             "scheduler_prefill_kv_pressure": 0.0,
             "scheduler_decode_kv_pressure": 0.0,
-            "scheduler_prefill_block_budget": 0.0,
-            "scheduler_decode_block_budget": 0.0,
-            "scheduler_prefill_admitted_blocks": 0.0,
-            "scheduler_decode_admitted_blocks": 0.0,
-            "scheduler_decode_growth_block_demand": 0.0,
-            "scheduler_decode_growth_blocks_admitted": 0.0,
             "scheduler_length_sort_passes": 0.0,
             "scheduler_length_sorted_sequences": 0.0,
             "scheduler_deferred_sequences": 0.0,
             "scheduler_max_concurrent_sequences": 0.0,
-            "paged_kv_block_size_tokens": 0.0,
-            "paged_kv_free_block_count": 0.0,
-            "paged_kv_used_block_count": 0.0,
-            "paged_kv_allocator_occupancy": 0.0,
-            "paged_kv_block_reuse_count": 0.0,
-            "paged_kv_allocator_pressure": 0.0,
-            "paged_kv_max_blocks_in_use": 0.0,
-            "paged_kv_resident_sequences": 0.0,
-            "paged_kv_preempted_sequences": 0.0,
-            "paged_kv_max_preempted_sequences": 0.0,
         }
 
     def _infer_device(self) -> torch.device:

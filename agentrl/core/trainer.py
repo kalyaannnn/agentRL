@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import random
-import importlib.util
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,13 +14,11 @@ import torch
 
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 from agentrl.core.config import GRPOConfig
-from agentrl.core.rollout import RolloutBatch, RolloutOrchestrator
+from agentrl.core.rollout import RolloutBatch, RolloutOrchestrator, RolloutSource
 from agentrl.generation.continuous import ContinuousBatchingOrchestrator
 from agentrl.generation.scheduler import compute_safe_chunk_size
-from agentrl.generation.speculative import SpeculativeRolloutOrchestrator
 from agentrl.memory.buffer import TrajectoryBuffer
 from agentrl.memory.layout import SharedWeightLayout
-from agentrl.observability.debugger import AgentRLDebugger
 from agentrl.observability.logger import MetricsLogger
 from agentrl.observability.profiler import SystemsProfiler
 from agentrl.runtime.controller import ExecutionController
@@ -56,10 +53,6 @@ class GRPOObjectiveStats:
     clip_ratio_region_mean: float
     clip_ratio_low_mean: float
     clip_ratio_high_mean: float
-    triton_kernel_requested: bool = False
-    triton_kernel_used: bool = False
-    triton_kernel_target: str = "none"
-    triton_fallback_reason: str = ""
 
     @property
     def policy_loss(self) -> float:
@@ -123,53 +116,8 @@ def _compute_clipped_grpo_objective(
     beta: float,
     ref_logprobs: torch.Tensor | None,
     clip_range: float,
-    use_triton_kernel: bool = False,
 ) -> GRPOObjectiveStats:
     """Compute the sampled-token clipped GRPO objective and parity metrics."""
-
-    triton_kernel_target = "grpo_objective" if use_triton_kernel else "none"
-    triton_fallback_reason = ""
-    if use_triton_kernel and beta == 0.0:
-        triton_result = None
-        if not current_logprobs.is_cuda:
-            triton_fallback_reason = "cuda_unavailable"
-        elif importlib.util.find_spec("triton") is None:
-            triton_fallback_reason = "triton_unavailable"
-        else:
-            try:
-                from agentrl.kernels import triton_clipped_grpo_objective
-
-                triton_result = triton_clipped_grpo_objective(
-                    current_logprobs=current_logprobs,
-                    old_logprobs=old_logprobs,
-                    advantages=advantages,
-                    sampled_token_mask=sampled_token_mask,
-                    epsilon=epsilon,
-                    clip_range=clip_range,
-                )
-            except ImportError:
-                triton_fallback_reason = "triton_unavailable"
-        if triton_result is not None:
-            zero = triton_result.policy_loss_tensor.new_zeros(())
-            return GRPOObjectiveStats(
-                policy_loss_tensor=triton_result.policy_loss_tensor,
-                kl_loss_tensor=zero,
-                total_loss_tensor=triton_result.policy_loss_tensor,
-                mean_ratio=float(triton_result.mean_ratio_tensor.detach().item()),
-                mean_token_kl=0.0,
-                clip_ratio_region_mean=float(
-                    triton_result.clip_ratio_region_mean_tensor.detach().item()
-                ),
-                clip_ratio_low_mean=float(triton_result.clip_ratio_low_mean_tensor.detach().item()),
-                clip_ratio_high_mean=float(triton_result.clip_ratio_high_mean_tensor.detach().item()),
-                triton_kernel_requested=True,
-                triton_kernel_used=True,
-                triton_kernel_target=triton_kernel_target,
-            )
-        if not triton_fallback_reason:
-            triton_fallback_reason = "unsupported_layout_or_dtype"
-    elif use_triton_kernel and beta > 0.0:
-        triton_fallback_reason = "kl_enabled"
 
     broadcast_advantages = advantages.to(
         device=current_logprobs.device,
@@ -214,10 +162,6 @@ def _compute_clipped_grpo_objective(
         clip_ratio_high_mean=float(
             _masked_token_mean(high_clip.to(dtype=current_logprobs.dtype), sampled_token_mask).detach().item()
         ),
-        triton_kernel_requested=use_triton_kernel,
-        triton_kernel_used=False,
-        triton_kernel_target=triton_kernel_target,
-        triton_fallback_reason=triton_fallback_reason,
     )
 
 
@@ -231,18 +175,15 @@ class GRPOTrainer:
         verifier: BaseVerifier,
         tokenizer: Any | None = None,
         layout: SharedWeightLayout | Any | None = None,
-        rollout_orchestrator: RolloutOrchestrator | None = None,
-        draft_model: Any | None = None,
+        rollout_orchestrator: RolloutSource | None = None,
         metrics_logger: MetricsLogger | None = None,
         trajectory_buffer: TrajectoryBuffer | None = None,
         profiler: SystemsProfiler | None = None,
-        debugger: AgentRLDebugger | None = None,
     ) -> None:
         self.config = config
         self.environment = environment
         self.verifier = verifier
         self._set_seed()
-        self._validate_experimental_flags()
         self.tokenizer = tokenizer or self._build_tokenizer()
         self.layout = layout or self._build_layout()
         self.device = self._resolve_device()
@@ -252,7 +193,7 @@ class GRPOTrainer:
         self.runtime_controller = ExecutionController(config=self.config, device=self.device)
         self.gradient_checkpointing_enabled = self._maybe_enable_gradient_checkpointing()
 
-        self.rollout = rollout_orchestrator or self._build_rollout_orchestrator(draft_model=draft_model)
+        self.rollout = rollout_orchestrator or self._build_rollout_orchestrator()
         self.metrics_logger = metrics_logger or MetricsLogger(
             output_dir=self.config.output_dir,
             jsonl_name=self.config.jsonl_metrics_name,
@@ -265,7 +206,6 @@ class GRPOTrainer:
             max_batches=self.config.trajectory_buffer_max_batches,
         )
         self.profiler = profiler or SystemsProfiler()
-        self.debugger = debugger
         self.optimizer = torch.optim.AdamW(
             self.layout.trainable_parameters(),
             lr=self.config.lr,
@@ -277,22 +217,6 @@ class GRPOTrainer:
         self.current_beta = float(self.config.beta)
         self.startup_report = self._build_startup_report()
         self._log_startup_report()
-
-    def _validate_experimental_flags(self) -> None:
-        """Reject experimental runtime flags that are not implemented yet."""
-
-        if self.config.use_async_rollout_workers:
-            raise NotImplementedError(
-                "use_async_rollout_workers is reserved for a future CPU worker path and is not implemented yet."
-            )
-        if self.config.use_async_trajectory_copy:
-            raise NotImplementedError(
-                "use_async_trajectory_copy is reserved for a future pinned-memory copy path and is not implemented yet."
-            )
-        if self.config.experimental_vllm_rollout:
-            raise NotImplementedError(
-                "experimental_vllm_rollout is reserved for a future optional vLLM rollout path and is not implemented yet."
-            )
 
     def train(self) -> list[dict[str, float]]:
         """Run the configured GRPO training loop."""
@@ -350,47 +274,24 @@ class GRPOTrainer:
                 system_metrics["cache_reuse_effectiveness"] = float(
                     batch.metadata.get("cache_reuse_effectiveness", 0.0)
                 )
-                system_metrics["paged_kv_block_size_tokens"] = float(
-                    batch.metadata.get("paged_kv_block_size_tokens", 0.0)
+                system_metrics["cache_hit_tokens"] = float(batch.metadata.get("cache_hit_tokens", 0.0))
+                system_metrics["cache_hit_ratio"] = float(batch.metadata.get("cache_hit_ratio", 0.0))
+                system_metrics["prefill_token_savings_pct"] = float(
+                    batch.metadata.get("prefill_token_savings_pct", 0.0)
                 )
-                system_metrics["paged_kv_free_block_count"] = float(
-                    batch.metadata.get("paged_kv_free_block_count", 0.0)
+                system_metrics["cache_size_blocks"] = float(batch.metadata.get("cache_size_blocks", 0.0))
+                system_metrics["cache_evictions_per_step"] = float(
+                    batch.metadata.get("cache_evictions_per_step", 0.0)
                 )
-                system_metrics["paged_kv_used_block_count"] = float(
-                    batch.metadata.get("paged_kv_used_block_count", 0.0)
+                system_metrics["cuda_graph_decode_requested"] = float(
+                    batch.metadata.get("cuda_graph_decode_requested", 0.0)
                 )
-                system_metrics["paged_kv_allocator_occupancy"] = float(
-                    batch.metadata.get("paged_kv_allocator_occupancy", 0.0)
+                system_metrics["cuda_graph_decode_used"] = float(batch.metadata.get("cuda_graph_decode_used", 0.0))
+                system_metrics["cuda_graph_decode_fallbacks"] = float(
+                    batch.metadata.get("cuda_graph_decode_fallbacks", 0.0)
                 )
-                system_metrics["paged_kv_block_reuse_count"] = float(
-                    batch.metadata.get("paged_kv_block_reuse_count", 0.0)
-                )
-                system_metrics["paged_kv_allocator_pressure"] = float(
-                    batch.metadata.get("paged_kv_allocator_pressure", 0.0)
-                )
-                system_metrics["paged_kv_max_blocks_in_use"] = float(
-                    batch.metadata.get("paged_kv_max_blocks_in_use", 0.0)
-                )
-                system_metrics["paged_kv_resident_sequences"] = float(
-                    batch.metadata.get("paged_kv_resident_sequences", 0.0)
-                )
-                system_metrics["paged_kv_preempted_sequences"] = float(
-                    batch.metadata.get("paged_kv_preempted_sequences", 0.0)
-                )
-                system_metrics["paged_kv_max_preempted_sequences"] = float(
-                    batch.metadata.get("paged_kv_max_preempted_sequences", 0.0)
-                )
-                system_metrics["scheduler_prefill_block_budget"] = float(
-                    batch.metadata.get("scheduler_prefill_block_budget", 0.0)
-                )
-                system_metrics["scheduler_decode_block_budget"] = float(
-                    batch.metadata.get("scheduler_decode_block_budget", 0.0)
-                )
-                system_metrics["scheduler_prefill_admitted_blocks"] = float(
-                    batch.metadata.get("scheduler_prefill_admitted_blocks", 0.0)
-                )
-                system_metrics["scheduler_decode_admitted_blocks"] = float(
-                    batch.metadata.get("scheduler_decode_admitted_blocks", 0.0)
+                system_metrics["cuda_graph_decode_captures"] = float(
+                    batch.metadata.get("cuda_graph_decode_captures", 0.0)
                 )
                 system_metrics["scheduler_prefill_token_budget"] = float(
                     batch.metadata.get("scheduler_prefill_token_budget", 0.0)
@@ -447,8 +348,6 @@ class GRPOTrainer:
                 system_metrics.update(self.runtime_controller.observe(system_metrics))
                 merged_metrics = {**metrics, **system_metrics}
                 self.metrics_logger.log(step, merged_metrics)
-                if self.debugger is not None:
-                    self.debugger.capture(step, batch, merged_metrics)
                 metrics_with_step = {"step": float(step), **merged_metrics}
                 history.append(metrics_with_step)
                 if (step + 1) % self.config.save_every == 0:
@@ -506,7 +405,6 @@ class GRPOTrainer:
                 beta=self.current_beta,
                 ref_logprobs=ref_logprobs,
                 clip_range=self.config.clip_range,
-                use_triton_kernel=self.config.use_triton_kernels,
             )
 
         scaled_loss = objective.total_loss_tensor / float(self.config.gradient_accumulation_steps)
@@ -545,10 +443,6 @@ class GRPOTrainer:
             "clip_ratio/low_mean": objective.clip_ratio_low_mean,
             "clip_ratio/high_mean": objective.clip_ratio_high_mean,
             "mean_ratio": objective.mean_ratio,
-            "triton_kernel_requested": float(objective.triton_kernel_requested),
-            "triton_kernel_used": float(objective.triton_kernel_used),
-            "triton_kernel_target": objective.triton_kernel_target,
-            "triton_fallback_reason": objective.triton_fallback_reason or "none",
         }
 
     def _build_lr_scheduler(self):
@@ -741,7 +635,7 @@ class GRPOTrainer:
             adapter_path=self.config.init_adapter_path,
         )
 
-    def _build_rollout_orchestrator(self, draft_model: Any | None = None) -> RolloutOrchestrator:
+    def _build_rollout_orchestrator(self) -> RolloutSource:
         """Select the configured rollout orchestrator implementation."""
 
         common_kwargs = {
@@ -753,8 +647,6 @@ class GRPOTrainer:
             "device": self.device,
             "rng": self.rng,
         }
-        if self.config.use_speculative_decoding:
-            return SpeculativeRolloutOrchestrator(draft_model=draft_model, **common_kwargs)
         if self.config.use_continuous_batching:
             return ContinuousBatchingOrchestrator(**common_kwargs)
         return RolloutOrchestrator(**common_kwargs)

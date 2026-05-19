@@ -7,7 +7,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
-from agentrl.byod import BYODTask
 from agentrl.core.base import BaseEnvironment, BaseVerifier
 
 
@@ -107,6 +106,18 @@ class AgentTrajectory:
     final_response: str
     done: bool
     success: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAgentTask:
+    """Bundled environment/verifier pair plus SFT sample export for tool agents."""
+
+    environment: BaseEnvironment
+    verifier: BaseVerifier
+    _supervised_samples_fn: Callable[[Any | None], list[tuple[str, str]]]
+
+    def supervised_samples(self, tokenizer: Any | None = None) -> list[tuple[str, str]]:
+        return self._supervised_samples_fn(tokenizer)
 
 
 class _ToolAgentEnvironment(BaseEnvironment):
@@ -381,7 +392,7 @@ def make_tool_agent_task(
     final_answer_fn: FinalAnswerFn,
     reward_fn: RewardFn | None = None,
     seed: int = 0,
-) -> BYODTask:
+) -> ToolAgentTask:
     """Build a multi-turn tool-agent task from records, tools, and a verifier hook."""
 
     environment = _ToolAgentEnvironment(
@@ -403,7 +414,7 @@ def make_tool_agent_task(
             raise ValueError("No supervised traces found for this tool agent task.")
         return samples
 
-    return BYODTask(
+    return ToolAgentTask(
         environment=environment,
         verifier=verifier,
         _supervised_samples_fn=build_samples,
