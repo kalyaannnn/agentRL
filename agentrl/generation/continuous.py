@@ -961,27 +961,64 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         template = self._cache_template_from_model()
         if template is not None and not isinstance(template, tuple):
             try:
+                return self._build_cache_from_legacy_layers(legacy_cache, template=template)
+            except (TypeError, ValueError, AttributeError):
+                pass
+            try:
                 return self._construct_dynamic_cache(template, legacy_cache)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 pass
             try:
                 return self._cache_from_legacy(template, legacy_cache)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 pass
-
-        if DynamicCache is not None:
-            config = getattr(self.layout.model, "config", None)
-            constructor_attempts: list[dict[str, Any]] = [{"ddp_cache_data": legacy_cache}]
-            if config is not None:
-                constructor_attempts.insert(
-                    0, {"ddp_cache_data": legacy_cache, "config": config}
-                )
-            for kwargs in constructor_attempts:
-                try:
-                    return DynamicCache(**kwargs)
-                except TypeError:
-                    continue
         return legacy_cache
+
+    def _build_cache_from_legacy_layers(
+        self,
+        legacy_cache: tuple[tuple[torch.Tensor, ...], ...],
+        *,
+        template: Any | None = None,
+    ) -> Any:
+        """Populate a fresh model cache via per-layer ``update`` (no legacy classmethods)."""
+
+        template = template or self._cache_template_from_model()
+        if template is None or isinstance(template, tuple):
+            raise TypeError("Cannot rebuild a transformers cache without a model template.")
+
+        cache_type = type(template)
+        config = getattr(self.layout.model, "config", None)
+        cache: Any | None = None
+        init_attempts: list[dict[str, Any]] = []
+        if config is not None:
+            init_attempts.append({"config": config})
+        init_attempts.append({})
+        for kwargs in init_attempts:
+            try:
+                cache = cache_type(**kwargs)
+                break
+            except TypeError:
+                continue
+        if cache is None:
+            cache = cache_type()
+
+        layers = getattr(cache, "layers", None)
+        if not layers:
+            raise TypeError(f"Cache type {cache_type!r} did not expose layers after init.")
+
+        if len(layers) != len(legacy_cache):
+            raise TypeError(
+                f"Legacy cache has {len(legacy_cache)} layers but rebuilt cache has {len(layers)}."
+            )
+
+        for layer, layer_tensors in zip(layers, legacy_cache, strict=True):
+            key_states = layer_tensors[0]
+            value_states = layer_tensors[1]
+            update_layer = getattr(layer, "update", None)
+            if not callable(update_layer):
+                raise TypeError(f"Cache layer {type(layer)!r} has no update() method.")
+            update_layer(key_states, value_states)
+        return cache
 
     def _cache_template_from_model(self) -> Any:
         """Capture one model-emitted cache object to use as a reconstruction template."""
@@ -1078,6 +1115,11 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
     ) -> Any:
         """Rebuild a DynamicCache-compatible instance from layer tensors."""
 
+        try:
+            return self._build_cache_from_legacy_layers(ddp_cache_data, template=cache_like)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
         cache_type = type(cache_like)
         cache_kwargs: dict[str, Any] = {}
         config = getattr(self.layout.model, "config", None)
@@ -1091,7 +1133,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             cache_kwargs["offload_only_non_sliding"] = offload_only_non_sliding
         try:
             return cache_type(ddp_cache_data=ddp_cache_data, **cache_kwargs)
-        except TypeError:
+        except (TypeError, AttributeError):
             return cache_type(ddp_cache_data=ddp_cache_data)
 
     @staticmethod
@@ -1110,7 +1152,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
     def _stack_constructor_cache(self, caches: list[Any]) -> Any:
         """Batch constructor-based caches without using the generic legacy bridge."""
 
-        stacked = self._stack_legacy_cache([cache.to_legacy_cache() for cache in caches])
+        stacked = self._stack_legacy_cache([self._cache_to_legacy(cache) for cache in caches])
         return self._construct_constructor_cache(caches[0], stacked)
 
     def _split_constructor_cache(self, cache: Any, batch_size: int) -> list[Any]:
@@ -1119,7 +1161,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         del batch_size
         return [
             self._construct_constructor_cache(cache, sequence_cache)
-            for sequence_cache in self._split_legacy_cache(cache.to_legacy_cache())
+            for sequence_cache in self._split_legacy_cache(self._cache_to_legacy(cache))
         ]
 
     @staticmethod
@@ -1171,20 +1213,13 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         if isinstance(cache, tuple):
             return cache
 
-        to_legacy_cache = getattr(cache, "to_legacy_cache", None)
-        if callable(to_legacy_cache):
-            return to_legacy_cache()
-
         layers = getattr(cache, "layers", None)
         if layers is not None:
-            legacy_layers = []
+            legacy_layers: list[tuple[torch.Tensor, ...]] = []
             for layer in layers:
-                keys = getattr(layer, "keys", None)
-                values = getattr(layer, "values", None)
-                if keys is None or values is None:
-                    keys = getattr(layer, "key_cache", None)
-                    values = getattr(layer, "value_cache", None)
-                if keys is None or values is None:
+                try:
+                    keys, values = self._dynamic_cache_layer_tensors(layer)
+                except TypeError:
                     break
                 legacy_layers.append((keys, values))
             else:
@@ -1198,6 +1233,13 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
                 for keys, values in zip(key_cache, value_cache, strict=True)
             )
 
+        to_legacy_cache = getattr(cache, "to_legacy_cache", None)
+        if callable(to_legacy_cache):
+            try:
+                return to_legacy_cache()
+            except AttributeError:
+                pass
+
         raise TypeError(f"Unsupported cache type for conversion: {type(cache)!r}")
 
     def _cache_from_legacy(
@@ -1210,27 +1252,19 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
         if isinstance(cache_like, tuple):
             return legacy_cache
 
-        cache_type = type(cache_like)
+        try:
+            return self._build_cache_from_legacy_layers(legacy_cache, template=cache_like)
+        except (TypeError, ValueError, AttributeError):
+            pass
+
         try:
             return self._construct_dynamic_cache(cache_like, legacy_cache)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             pass
 
-        # Cache implementations can often be reconstructed from legacy tuples
-        # via their constructor without touching ``from_legacy_cache``.
-        try:
-            return cache_type(ddp_cache_data=legacy_cache)
-        except TypeError:
-            pass
-
-        config = getattr(self.layout.model, "config", None)
-        if config is not None:
-            try:
-                return cache_type(ddp_cache_data=legacy_cache, config=config)
-            except TypeError:
-                pass
-
-        raise TypeError(f"Unsupported cache type for reconstruction: {cache_type!r}")
+        raise TypeError(
+            f"Unsupported cache type for reconstruction: {type(cache_like)!r}"
+        )
 
     def _stack_legacy_cache(
         self,
