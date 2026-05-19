@@ -90,6 +90,7 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             device=self.device,
             torch_compile=self.config.torch_compile,
         )
+        self._forward_cache_template: Any | None = None
 
     def collect(self) -> RolloutBatch:
         """Collect one rollout batch using continuous per-step scheduling."""
@@ -939,9 +940,42 @@ class ContinuousBatchingOrchestrator(RolloutOrchestrator):
             return cache
         if isinstance(cache, tuple):
             if DynamicCache is not None:
-                return DynamicCache.from_legacy_cache(cache)
+                from_legacy_cache = getattr(DynamicCache, "from_legacy_cache", None)
+                if callable(from_legacy_cache):
+                    return from_legacy_cache(cache)
+                template = self._cache_template_from_model()
+                if isinstance(template, DynamicCache):
+                    return self._construct_dynamic_cache(template, cache)
+                if not isinstance(template, tuple):
+                    return self._cache_from_legacy(template, cache)
+                config = getattr(self.layout.model, "config", None)
+                if config is not None:
+                    try:
+                        return DynamicCache(ddp_cache_data=cache, config=config)
+                    except TypeError:
+                        pass
+                try:
+                    return DynamicCache(ddp_cache_data=cache)
+                except TypeError:
+                    pass
             return cache
         return cache
+
+    def _cache_template_from_model(self) -> Any:
+        """Capture one model-emitted cache object to use as a reconstruction template."""
+
+        if self._forward_cache_template is not None:
+            return self._forward_cache_template
+
+        generation_model = self.layout.model
+        bos_token_id = getattr(self.tokenizer, "bos_token_id", None)
+        if bos_token_id is None:
+            bos_token_id = getattr(self.tokenizer, "eos_token_id", 0)
+        input_ids = torch.tensor([[int(bos_token_id)]], device=self.device, dtype=torch.long)
+        with torch.no_grad():
+            outputs = generation_model(input_ids=input_ids, use_cache=True)
+        self._forward_cache_template = outputs.past_key_values
+        return self._forward_cache_template
 
     def _stack_past_key_values(self, caches: list[Any]) -> Any:
         """Batch multiple single-sequence cache objects into one cache."""
