@@ -29,14 +29,32 @@ Colab:
 | **Chunked prefill** and persistent-KV decode | Policy / reference **shared-base LoRA** layout |
 | **CUDA graph decode** on CUDA (optional, eager fallback) | JSONL metrics, checkpoints, shaped verifier rewards |
 
-The runtime helps any workload with **shared prompt prefixes** on one GPU: grouped GRPO sampling, multi-turn agent transcripts, or few-shot prompts with a common system block. **You define the task** (environment + verifier, or `make_tool_agent_task`); the repo does not ship bundled datasets or example environments.
+The runtime helps any workload with **shared prompt prefixes** on one GPU: grouped GRPO sampling, multi-turn agent transcripts, or few-shot prompts with a common system block. **You define the task** (`BaseEnvironment` + `BaseVerifier`); the repo does not ship bundled datasets or example environments.
+
+## Systems demo (GSM8K, single A100)
+
+End-to-end run from [`systems_demo_abcd.ipynb`](systems_demo_abcd.ipynb): SFT bootstrap on GSM8K, then GRPO with three runtime modes from the same SFT adapter, same seed, 80 steps.
+
+| Mode | Step time (ms) | Tokens/sec | Cache hit ratio | Prefill savings | Peak VRAM (MB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A — standard | 19315.6 | 13.2 | 0.00 | 0.0% | 10841.9 |
+| B — continuous batching | 7761.7 | 32.7 | 0.00 | 0.0% | 11008.4 |
+| C — continuous + prefix cache | 7473.7 | 33.4 | 0.92 | 92.0% | 10877.3 |
+
+Headline:
+
+- B alone gives **~2.5× faster step time** and **~2.5× tokens/sec** vs A on the same GRPO workload.
+- Adding prefix cache in C contributes **~92% prefill-token savings** and a **~0.92 cache hit ratio** with no extra VRAM cost.
+- VRAM stays flat across modes (~10.6–10.7 GB), so throughput is gained without expanding the memory budget.
+
+Model: `Qwen/Qwen2.5-1.5B-Instruct`, bf16, group_size=4, batch_size=2, max_new_tokens=48, single A100.
 
 ## Recommended workflow
 
 Sparse verifier rewards rarely work from a cold start:
 
-1. Define task records with `supervised_trace` when possible.
-2. Run **`SFTBootstrapTrainer`** to teach action format.
+1. Define your `BaseEnvironment` + `BaseVerifier` and prepare prompt/target pairs.
+2. Run **`SFTBootstrapTrainer`** to teach the output format.
 3. Run **`GRPOTrainer`** with `init_adapter_path` pointing at the bootstrap adapter.
 4. Compare runtime modes (standard → continuous → prefix cache → CUDA graphs) while checking reward stays stable.
 
@@ -44,78 +62,44 @@ Sparse verifier rewards rarely work from a cold start:
 
 ```python
 from agentrl import (
-    AgentTaskRecord,
+    BaseEnvironment,
+    BaseVerifier,
     GRPOConfig,
     GRPOTrainer,
-    SFTBootstrapTrainer,
-    ToolSpec,
-    make_tool_agent_task,
-)
-from agentrl.memory.layout import SharedWeightLayout
-from peft import LoraConfig
-from transformers import AutoTokenizer
-
-LOOKUP = {"alpha": "4", "beta": "9"}
-
-records = [
-    AgentTaskRecord(
-        task_id="sum",
-        goal="Look up alpha and beta, add them, submit the result.",
-        metadata={"final_answer": "13"},
-        supervised_trace=(
-            "TOOL: lookup[alpha]",
-            "TOOL: lookup[beta]",
-            "TOOL: add[4,9]",
-            "FINAL: 13",
-        ),
-    ),
-]
-
-def split_args(raw: str) -> tuple[str, str]:
-    left, right = raw.split(",", 1)
-    return left.strip(), right.strip()
-
-task = make_tool_agent_task(
-    records=records,
-    tools=[
-        ToolSpec(
-            name="lookup",
-            description="Lookup a key.",
-            handler=lambda arg, _state: LOOKUP[arg.strip()],
-        ),
-        ToolSpec(
-            name="add",
-            description="Add two integers.",
-            handler=lambda arg, _state: str(
-                int(split_args(arg)[0]) + int(split_args(arg)[1])
-            ),
-        ),
-    ],
-    final_answer_fn=lambda record, _state: str(record.metadata["final_answer"]),
-    reward_fn=None,  # default shaped reward (not sparse 0/1)
 )
 
-# SFT bootstrap, then GRPO — see your Colab notebook for full ladder metrics.
+class MyEnvironment(BaseEnvironment):
+    def reset(self) -> str:
+        ...
+    def step(self, action: str) -> tuple[str, bool]:
+        ...
+    def state(self) -> dict:
+        ...
+
+class MyVerifier(BaseVerifier):
+    def verify(self, response: str, env_state: dict) -> float:
+        ...
+
 config = GRPOConfig(
     model_name="Qwen/Qwen2.5-1.5B-Instruct",
-    batch_size=1,
+    batch_size=2,
     group_size=4,
-    max_new_tokens=64,
-    max_episode_steps=4,
-    steps=5,
+    max_new_tokens=48,
+    steps=80,
     use_continuous_batching=True,
     use_prefix_cache=True,
+    init_adapter_path="./checkpoints/sft_bootstrap",  # optional warm start
 )
 
 trainer = GRPOTrainer(
     config=config,
-    environment=task.environment,
-    verifier=task.verifier,
+    environment=MyEnvironment(),
+    verifier=MyVerifier(),
 )
 # trainer.train()
 ```
 
-Pass `reward_fn=None` to use the built-in shaped tool-agent verifier (partial credit for tool steps, penalty for invalid actions, `1.0` on success).
+For a working end-to-end example (SFT bootstrap on GSM8K, format-repair pass, GRPO A/B/C ladder), see [`systems_demo_abcd.ipynb`](systems_demo_abcd.ipynb).
 
 ## Runtime flags (`GRPOConfig`)
 
@@ -132,19 +116,15 @@ Pass `reward_fn=None` to use the built-in shaped tool-agent verifier (partial cr
 
 ```python
 from agentrl import (
-    AgentTaskRecord,
     BaseEnvironment,
     BaseVerifier,
     GRPOConfig,
     GRPOTrainer,
     SFTBootstrapTrainer,
-    ToolSpec,
-    make_tool_agent_task,
 )
 ```
 
-- **Custom agents:** implement `BaseEnvironment` + `BaseVerifier`.
-- **Tool agents:** `make_tool_agent_task` with `TOOL: name[arg]` and `FINAL: answer` grammar.
+Implement `BaseEnvironment` (`reset`, `step`, `state`) and `BaseVerifier` (`verify`) for your task. See `systems_demo_abcd.ipynb` for a complete GSM8K example.
 
 ## Architecture
 
@@ -162,7 +142,6 @@ Your task (env + verifier)
 
 ```text
 agentrl/
-  agents.py          # make_tool_agent_task, shaped default verifier
   core/              # config, trainer, rollout, SFT
   generation/        # continuous batching, prefix cache, CUDA graphs
   memory/            # shared LoRA layout, trajectory buffer
@@ -188,7 +167,6 @@ agentrl/
 ## Security
 
 - Trajectory buffer save/load uses `torch.load(..., weights_only=False)`—do not load untrusted checkpoint files.
-- Register only trusted tool handlers; model-generated tool arguments run in your process.
 
 ## License
 
