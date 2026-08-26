@@ -1,6 +1,6 @@
 # AgentRL
 
-AgentRL is a readable **single-GPU inference runtime** for shared-prefix rollouts, with **SFT bootstrap** and **GRPO** for multi-turn, verifier-trained agents. Inspired by vLLM-style techniques (continuous batching, prefix caching, chunked prefill, CUDA graph decode), scoped for one GPU and a codebase you can read in an afternoon—not a production serving engine.
+AgentRL is a readable **single-GPU inference runtime** for shared-prefix rollouts, with **SFT bootstrap** and **GRPO** for multi-turn, verifier-trained agents. Inspired by vLLM-style techniques (continuous batching, prefix caching, chunked prefill), scoped for one GPU and a codebase you can read in an afternoon—not a production serving engine.
 
 **Hardware:** one CUDA GPU for the full systems path, or CPU for smoke tests. No multi-node orchestration.
 
